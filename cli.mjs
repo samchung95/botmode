@@ -483,8 +483,13 @@ async function restart() {
 }
 
 function update() {
-  // npm is a .cmd on Windows, which only a shell runs. Both arguments are fixed strings.
-  execFileSync("npm", ["install", "--global", SOURCE], { stdio: "inherit", shell: process.platform === "win32" });
+  try {
+    // npm is a .cmd on Windows, which only a shell runs. Both arguments are fixed strings.
+    execFileSync("npm", ["install", "--global", SOURCE], { stdio: "inherit", shell: process.platform === "win32" });
+  } catch {
+    throw new Error("The update did not install. If npm said EBUSY, an open botmode window is using its files: close every " +
+      "other botmode window, then run `botmode update` again.");
+  }
   execFileSync(process.execPath, [CLI, "restart"], { stdio: "inherit" }); // The new code restarts its own host.
 }
 
