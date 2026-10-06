@@ -1,0 +1,12 @@
+{
+  "name": "botmode",
+  "version": "0.1.0",
+  "description": "A team of AI bots behind one handler, in pi's TUI, across your machines.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "bin": { "botmode": "cli.mjs" },
+  "files": ["botmode.mjs", "cli.mjs", "README.md"],
+  "scripts": { "test": "node --test botmode.test.mjs" },
+  "dependencies": { "@earendil-works/pi-coding-agent": "0.99.1" },
+  "engines": { "node": ">=22.19.0" }
+}
