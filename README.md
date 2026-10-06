@@ -35,7 +35,7 @@ npm test                                  # in a checkout; no model needed
 ```
 
 Any arguments other than the commands below go straight to pi. In the TUI:
-- `/sessions` lists every bot session on this machine with its folder, and the ones at work on your other machines. Pick an idle one to switch this window into it and talk with that bot yourself; pick `handler` to come back to your own conversation. Pick one at work to see its steps and send it a message, which reaches it at its next step, or to stop it if this window started it. While you are in a session, handoffs to it are refused, so the bot never works in two places at once.
+- `/sessions`, or ← on an empty prompt, is the lobby: every bot session on this machine with its folder, and the ones at work on your other machines. Pick an idle one to switch this window into it and talk with that bot yourself, as in any pi session; pick `handler` to come back to your own conversation. Pick one at work on this machine to watch it: the window shows its conversation as it grows, what you type goes to the bot as a message that reaches it at its next step, and once it is done the session is yours to talk in. Pick it again in the lobby to stop it, if this window started it. One at work on another machine shows its steps, and takes a message or a stop the same way. `/sessions <id>` opens a session directly. While you are in a session, handoffs to it are refused, so the bot never works in two places at once; leaving one mid-reply stops the reply, so the lobby asks first.
 - `/bot <id> <message>` talks to one bot directly and waits for its reply, which is added to the handler's conversation.
 - `/model` changes the model for the session.
 
@@ -125,7 +125,8 @@ handoff to mac/dev ──HTTPS on the tailnet, token──▶ Mac: botmode host 
 
 - A worker's handoffs are synchronous, so it waits for the whole chain below it. Only your window works in the background.
 - Copies share their bot's folder unless a handoff gives them their own, so parallel copies in one folder can trip over each other's files. Their sessions stay in `sessions/` until you delete them.
-- `/sessions` enters only idle sessions on this machine. A session at work is writing its conversation file, so you message it instead, and it opens once its task is done. A session on another machine lives in that machine's files, so you reach it with a message, `/bot` or a handoff.
+- A session you watch is reloaded each time the bot writes to it, so it moves a message at a time, not a word at a time, and pi notes "Resumed session" each time. What you type while watching reaches the bot as a message from your handler, so the bot may answer in your handler's conversation as well as its own. A session on another machine lives in that machine's files, so you reach it with a message, `/bot` or a handoff, and do not watch it.
+- ← opens the lobby only in pi's own prompt editor, and only when it is empty; a terminal that sends ← some other way keeps `/sessions`.
 - `/sessions` waits for your other machines' rosters, up to 3 seconds for one that is off.
 - Changing a bot's `workspace` starts its own session afresh, because pi finds a session only from the folder it was started in. Its copies keep their folders.
 - Stopping a bot, with Esc or from `/sessions`, stops only that bot. Bots further down its chain, and processes their tools started, keep running until they finish.

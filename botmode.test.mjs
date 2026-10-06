@@ -17,33 +17,45 @@ const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, handOv
  * which a window shows when you enter it and a bot's own pi runs without one.
  */
 async function open(session, { window = !session } = {}) {
-  const tools = {}, commands = {}, events = {}, sent = [], status = {}, switched = [], notes = [];
+  const tools = {}, commands = {}, events = {}, sent = [], status = {}, switched = [], notes = [], dispatched = [];
+  const screen = { text: "", menu: false }; // What is typed at the prompt, and whether a menu has the keyboard instead.
+  let keys;
   botmode({
     on: (name, handler) => { events[name] = handler; },
     registerTool: (tool) => { tools[tool.name] = tool; },
     registerCommand: (name, command) => { commands[name] = command; },
     sendMessage: (message, options) => sent.push({ ...message, ...options }),
+    sendUserMessage: (text) => dispatched.push(text),
     setActiveTools: (names) => { status.tools = names; },
     setModel: async () => true,
     setThinkingLevel: () => {},
   });
   const ctx = {
     hasUI: window,
-    isIdle: () => false,
-    ui: { notify: (text) => notes.push(text), setStatus: (key, text) => { status[key] = text; }, setWidget: () => {}, select: async () => undefined,
-      confirm: async () => false, input: async () => undefined },
+    isIdle: () => window, // A bot's own pi is at work; a window waits for you.
+    ui: { notify: (text) => notes.push(text), setStatus: (key, text) => { status[key] = text; }, select: async () => undefined,
+      confirm: async () => false, input: async () => undefined, getEditorText: () => screen.text, setEditorText: (text) => { screen.text = text; },
+      // pi's prompt editor is the one part of its screen with onExtensionShortcut.
+      setWidget: (_key, content) => typeof content === "function" && content({ getFocusedComponent: () => screen.menu ? {} : { onExtensionShortcut: undefined } }),
+      onTerminalInput: (handler) => { keys = handler; return () => {}; } },
     sessionManager: {
       getSessionId: () => session ?? "owner",
       getSessionDir: () => session ? path.join(HOME, "sessions") : path.join(HOME, "owner"),
-      getSessionFile: () => session ? undefined : path.join(HOME, "owner", "owner.jsonl"),
+      getSessionFile: () => session ? fileOf(session) : path.join(HOME, "owner", "owner.jsonl"),
     },
     modelRegistry: { find: () => undefined },
     switchSession: async (file) => { switched.push(file); return { cancelled: false }; },
   };
   await events.session_start({ type: "session_start" }, ctx);
   const call = async (name, params) => (await tools[name].execute("call", params, undefined, undefined, ctx)).content[0].text;
-  return { ctx, call, commands, sent, status, switched, notes, close: () => events.session_shutdown({ type: "session_shutdown", reason: "quit" }, ctx) };
+  return { ctx, call, commands, sent, status, switched, notes, dispatched, screen,
+    press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
+    close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx) };
 }
+
+/** The newest file of a bot session, which is the one pi opens. */
+const fileOf = (session) => fs.readdirSync(path.join(HOME, "sessions")).filter((name) => name.endsWith(`_${session}.jsonl`)).sort()
+  .map((name) => path.join(HOME, "sessions", name)).at(-1);
 
 async function until(check, ms = 8000) {
   for (const end = Date.now() + ms; !check(); await new Promise((resolve) => setTimeout(resolve, 50))) {
@@ -129,6 +141,23 @@ test("bots message each other while they work, and a sender can wait for the ans
   }
 });
 
+test("← on an empty prompt opens /sessions; while you type, or in a menu, it still moves the cursor", async () => {
+  const handler = await open();
+  try {
+    assert.deepEqual(handler.press("\x1b[D"), { consume: true });
+    assert.deepEqual(handler.dispatched, ["/sessions"]);
+    handler.screen.text = "fix the typo";
+    assert.equal(handler.press("\x1b[D"), undefined);
+    handler.screen.text = "";
+    handler.screen.menu = true;
+    assert.equal(handler.press("\x1b[D"), undefined);
+    assert.equal(handler.press("x"), undefined);
+    assert.deepEqual(handler.dispatched, ["/sessions"]);
+  } finally {
+    handler.close();
+  }
+});
+
 test("/sessions enters a bot's session as that bot, and the overview goes back to the handler", async () => {
   const handler = await open();
   let shown;
@@ -137,13 +166,17 @@ test("/sessions enters a bot's session as that bot, and the overview goes back t
     return options.find((option) => option.startsWith("research.2 "));
   };
   try {
+    handler.ctx.isIdle = () => false; // Leaving stops your handler's reply, so you are asked first; this says no.
+    await handler.commands.sessions.handler("", handler.ctx);
+    assert.deepEqual(handler.switched, []);
+    handler.ctx.isIdle = () => true;
     await handler.commands.sessions.handler("", handler.ctx);
     assert.equal(shown[0], "handler · you are here");
     assert.match(shown.join("\n"), /^research\.2 · idle · /m);
     assert.match(handler.switched[0], /_research\.2\.jsonl$/);
     // pi opens research.2's session in this window: you now talk with that copy of research directly.
     const copy = await open("research.2", { window: true });
-    assert.equal(copy.status.botmode, "research.2 · /sessions goes back to your handler");
+    assert.equal(copy.status.botmode, "research.2 · ← or /sessions goes back to your handler");
     assert.ok(copy.status.tools.includes("message") && !copy.status.tools.includes("configure"));
     assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "x" }), /research\.2 is busy \(open in your window\)/);
     copy.ctx.ui.select = async (_title, options) => options[0];
@@ -180,20 +213,40 @@ test("a new copy can work in a folder of its own, and keeps it", async () => {
   }
 });
 
-test("you message a bot at work from /sessions, and a message it gets as it finishes is its next turn", async () => {
+test("/sessions opens a bot at work to watch, what you type goes to it, and once it is done you talk with it", async () => {
   const handler = await open();
-  handler.ctx.ui.select = async (title, options) => options.find((option) => option.startsWith(title === "Sessions" ? "research · working" : "Send"));
-  handler.ctx.ui.input = async () => "also check the archive";
+  handler.ctx.ui.select = async (_title, options) => options.find((option) => option.startsWith("research · working"));
+  let watched, talking, menu;
   try {
     assert.match(await handler.call("handoff", { bot: "research", session: "continue", task: "slow: long survey" }), /working on it/);
     await handler.commands.sessions.handler("", handler.ctx);
-    assert.deepEqual(handler.notes, ["Sent to research."]);
-    // fake-pi never reads its mail, so the message is still waiting when research finishes the survey.
+    assert.deepEqual(handler.switched, [fileOf("research")]);
+    // pi opens research's session in this window while research's own pi still works in it.
+    watched = await open("research", { window: true });
+    assert.match(watched.status.botmode, /^research is at work/);
+    assert.equal(watched.status.tools, undefined); // It writes nothing to the session, not even research's model.
+    assert.deepEqual(await watched.type("also check the archive"), { action: "handled" });
+    assert.deepEqual(watched.notes, ["Sent to research."]);
+    watched.ctx.ui.select = async (title, options) => title === "Sessions" ? options.find((option) => option.startsWith("research · you are here"))
+      : (menu = options, undefined);
+    await watched.commands.sessions.handler("", watched.ctx);
+    assert.deepEqual(menu, ["Send research a message", "Stop research"]);
+    // fake-pi never reads its mail, so the message is still waiting when research finishes the survey, and is its next turn.
     await until(() => handler.sent.length);
     assert.match(handler.sent[0].content, /^research replied:\nresearch heard: .*slow: long survey\n\n/s);
     assert.match(handler.sent[0].content, /\| \[Message from handler; answer with message to handler\]\nalso check the archive$/);
+    // Done, research is yours: the window opens its session again, now to talk with it.
+    await until(() => watched.dispatched.includes("/sessions research"));
+    await watched.commands.sessions.handler("research", watched.ctx);
+    assert.deepEqual(watched.switched, [fileOf("research")]);
+    watched.close({ reason: "resume", targetSessionFile: fileOf("research") });
+    talking = await open("research", { window: true });
+    assert.equal(talking.status.botmode, "research · ← or /sessions goes back to your handler");
+    assert.ok(talking.status.tools.includes("message"));
+    assert.match(await handler.call("handoff", { bot: "research", session: "continue", task: "x" }), /research is busy \(open in your window\)/);
   } finally {
     handler.close();
+    talking?.close();
   }
 });
 

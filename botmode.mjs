@@ -713,7 +713,7 @@ const replyText = (target, outcome) => `${outcome.session ?? target} ${outcome.o
 const WAIT = 10 * 60_000; // How long message waits for an answer before the answer comes as an ordinary message.
 
 export default function botmode(pi) {
-  let timer;
+  let timer, watching;
   const waiting = new Map(); // address -> resolves message's wait with that address's next message.
 
   /** Applies this bot's tools and model from the configuration: at start, and when the handler changes itself. */
@@ -743,25 +743,59 @@ export default function botmode(pi) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    await applySelf(ctx);
     const { session, box } = whoAmI(ctx);
-    if (box) {
+    // A bot's session that another pi works in: this window only shows it, writes nothing to it and leaves its mail alone.
+    watching = ctx.hasUI && session && !shared.entered.has(session) && holder(session) ? session : undefined;
+    if (!watching) await applySelf(ctx);
+    if (box && !watching) {
       timer = setInterval(() => readMail(ctx, box), 500);
       timer.unref(); // A worker's pi exits when its task is done, whatever is still scheduled.
     }
     if (!ctx.hasUI) return;
     if (!session) shared.home = ctx.sessionManager.getSessionFile();
-    ctx.ui.setStatus("botmode", session && `${session} · /sessions goes back to your handler`);
+    // ← on an empty prompt opens /sessions, as in Claude Code. Every key reaches this listener first, menus' too, and only
+    // pi's prompt editor has onExtensionShortcut; the empty widget is how an extension gets hold of pi's screen, which
+    // pi's RPC mode does not have.
+    let screen;
+    const atPrompt = () => !screen || "onExtensionShortcut" in (screen.getFocusedComponent() ?? {});
+    ctx.ui.setWidget("botmode-keys", (tui) => (screen = tui, { render: () => [], invalidate: () => {} }), { placement: "belowEditor" });
+    ctx.ui.onTerminalInput((key) => {
+      if (!["\x1b[D", "\x1bOD"].includes(key) || ctx.ui.getEditorText() || !atPrompt()) return;
+      pi.sendUserMessage("/sessions", { expandPromptTemplates: true });
+      return { consume: true };
+    });
+    if (watching) {
+      // pi shows a session as it was when opened, so open it again whenever the bot writes to it, and when it is done.
+      const file = ctx.sessionManager.getSessionFile();
+      const size = fs.statSync(file).size;
+      timer = setInterval(() => {
+        if ((holder(watching) && fs.statSync(file, { throwIfNoEntry: false })?.size === size) || !atPrompt()) return;
+        clearInterval(timer);
+        pi.sendUserMessage(`/sessions ${watching}`, { expandPromptTemplates: true });
+      }, 1000);
+      timer.unref();
+    }
+    ctx.ui.setStatus("botmode", watching ? `${session} is at work · what you type goes to it · ← sessions`
+      : session && `${session} · ← or /sessions goes back to your handler`);
     shared.render = () => ctx.ui.setWidget("botmode", shared.running.size
       ? [...shared.running].map((run) => `⏳ ${run.steps.split("\n").at(-1) || `${run.name}: starting`}`) : undefined);
     shared.render();
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     clearInterval(timer);
     shared.render = undefined;
     const { session } = whoAmI(ctx);
+    if (event.targetSessionFile === ctx.sessionManager.getSessionFile()) return; // Opened again, as when a bot you watch is done.
     if (shared.entered.delete(session)) release(session); // You left it, so bots may work in it again.
+  });
+
+  pi.on("input", async (event, ctx) => {
+    if (!watching || event.source === "extension") return { action: "continue" };
+    const sent = await deliver(loadConfig(), watching, HANDLER, event.text);
+    ctx.ui.notify(sent.text, sent.ok ? "info" : "warning");
+    if (!sent.ok) ctx.ui.setEditorText(event.text); // It has just finished; send it again once the window has it.
+    return { action: "handled" };
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -858,15 +892,24 @@ export default function botmode(pi) {
     },
   });
 
-  /** Opens an idle bot session in this window; while it is open there, no handoff runs in it. */
-  async function enter(ctx, session, file) {
-    if (!claim(session, "open in your window")) return ctx.ui.notify(`${session} has just started working; open it once it is done.`, "info");
-    shared.entered.add(session);
+  /** Leaving a session stops what it is doing, so ask first while it works. */
+  const mayLeave = (ctx) => ctx.isIdle() || ctx.ui.confirm("Leave this session?", "It is still working, and leaving stops it.");
+
+  /**
+   * Opens a bot session in this window: an idle one to talk with, and no handoff runs in it while it is open there; one at
+   * work to watch, which the window takes over once the bot is done.
+   */
+  async function focus(ctx, session) {
+    const file = sessionFiles().get(session);
+    if (!file) return watch(ctx, session, holder(session)?.task); // A new copy has no session to show before its first step.
+    if (!(await mayLeave(ctx))) return;
+    const entering = claim(session, "open in your window");
+    if (entering) shared.entered.add(session);
     const switched = await ctx.switchSession(file).catch((error) => { // pi refuses a session whose folder is gone.
       ctx.ui.notify(`${session}: ${reason(error)}`, "error");
       return { cancelled: true };
     });
-    if (switched.cancelled) {
+    if (switched.cancelled && entering) {
       shared.entered.delete(session);
       release(session);
     }
@@ -885,19 +928,23 @@ export default function botmode(pi) {
   }
 
   pi.registerCommand("sessions", {
-    description: "See every bot session: enter one to talk with that bot, or go back to your handler",
-    async handler(_args, ctx) {
+    description: "See every bot session and open one to talk with that bot, or watch it work; /sessions <id> opens that one",
+    async handler(args, ctx) {
       const config = loadConfig();
       const here = whoAmI(ctx).session;
       const busy = new Map(working().map((session) => [session.id, session.task]));
       const files = sessionFiles();
-      const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}`, () => here && ctx.switchSession(shared.home)]]);
+      if (args.trim()) {
+        return files.has(args.trim()) || busy.has(args.trim()) ? focus(ctx, args.trim()) : ctx.ui.notify(`There is no session ${args.trim()} here.`, "warning");
+      }
+      const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}`,
+        async () => here && await mayLeave(ctx) && ctx.switchSession(shared.home)]]);
       for (const session of new Set([...files.keys(), ...busy.keys()])) {
         // handler here is another machine's handler talking with this one, not a bot of yours; skip removed bots too.
         if (session === HANDLER || !Object.hasOwn(config.bots, botOf(session))) continue;
         const state = session === here ? "you are here" : busy.has(session) ? `working · ${busy.get(session)}` : `idle · ${ago(files.get(session))}`;
-        choices.set(`${session} · ${state} · ${folderOf(config, session, files.get(session))}`, () => session === here || (busy.has(session) ? watch(ctx, session, busy.get(session))
-          : enter(ctx, session, files.get(session))));
+        choices.set(`${session} · ${state} · ${folderOf(config, session, files.get(session))}`, () => session !== here ? focus(ctx, session)
+          : watching && watch(ctx, session, busy.get(session)));
       }
       const remote = new Set();
       for (const [host, team] of Object.entries(await remoteTeams(config))) {
