@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { HOME, PORT, applyPatch, callHost, hasToken, inviteCode, loadConfig, readInvite, remoteTeams, saveToken, serve, setHost, token }
+import { HOME, PORT, applyPatch, callHost, hasToken, inviteCode, loadConfig, readInvite, remoteTeams, saveToken, serve, setHost, token, working }
   from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
@@ -444,9 +444,10 @@ async function status() {
   say(`Tailnet   ${net.problem ?? (sharedOnTailnet(net) === LOCAL ? `shared at ${net.url}` : "not shared")}`);
   if (process.platform === "win32") say(`Admin     the host runs ${hostRunsAsAdmin() ? "as administrator" : "with your normal rights"}`);
   if (process.platform === "darwin") say(`Admin     ${fs.existsSync(SUDOERS) ? "your bots can use sudo without a password" : "sudo asks your bots for a password"}`);
+  say(`Working   ${working().map((session) => session.id).join(", ") || "nothing right now"}`);
   for (const [id, { url }] of Object.entries(config.hosts ?? {})) {
     const team = teams[id];
-    say(`Machine   ${id}  ${url}  ${Array.isArray(team) ? `bots: ${team.map((bot) => bot.id).join(", ") || "none"}` : `unavailable (${team})`}`);
+    say(`Machine   ${id}  ${url}  ${typeof team === "string" ? `unavailable (${team})` : `bots: ${team.bots.map((bot) => bot.id).join(", ") || "none"}`}`);
   }
 }
 
