@@ -2,12 +2,15 @@
 // The `botmode` command. With no command it opens your handler in pi's TUI, and other arguments go to pi. `setup`,
 // `invite`, `status` and `teardown` set up, connect, check and undo this machine; `host` is what runs in the background.
 import { execFileSync, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
-import { fileURLToPath } from "node:url";
-import { HOME, PORT, applyPatch, callHost, hasToken, inviteCode, loadConfig, readInvite, remoteTeams, saveToken, serve, setHost, token, working }
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { HANDLER, HOME, PORT, applyPatch, callHost, hasToken, inviteCode, loadConfig, readInvite, remoteTeams, saveToken, serve, setHost, token, working }
   from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
@@ -500,9 +503,95 @@ function openHandler(args) {
   spawn(process.execPath, [PI, "-e", EXTENSION, "-e", DRAWING, ...args], { stdio: "inherit" }).on("exit", (code) => process.exit(code ?? 1));
 }
 
+/**
+ * Your window as rooms: a pi in a terminal of its own for each conversation you open, your handler's first, shown one at a
+ * time. A room's lobby (← or /sessions) asks this process for another room; the one you leave carries on out of sight
+ * while it is at work and closes once it is idle, so leaving never stops anything. Without node-pty, or a terminal to
+ * draw in, one pi switches between sessions itself.
+ */
+async function openWindow(args) {
+  const pty = process.stdin.isTTY && await import("node-pty").then((module) => module.default, () => undefined);
+  if (!pty) return openHandler(args);
+  if (process.platform === "darwin") { // node-pty 1.1.0 ships its Mac helper without the right to run.
+    try {
+      fs.chmodSync(path.join(path.dirname(createRequire(import.meta.url).resolve("node-pty")), "..", "prebuilds", `darwin-${process.arch}`, "spawn-helper"), 0o755);
+    } catch {} // An install you cannot change: if node-pty then cannot start a terminal, you get one pi below.
+  }
+  const rooms = new Map(); // name -> {term, busy}
+  let shown, started = 0, seen = 0; // Rooms started, and those that ended in sight.
+  const secret = crypto.randomBytes(16).toString("hex");
+  const server = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    res.end();
+    if (req.url !== `/${secret}`) return;
+    try {
+      const { room, busy, open, args, cwd } = JSON.parse(body);
+      if (rooms.has(room)) rooms.get(room).busy = busy === true;
+      if (typeof open === "string") {
+        if (!rooms.has(open) && Array.isArray(args)) start(open, args, cwd);
+        show(open);
+      } else if (!busy && room !== shown && room !== HANDLER) close(room); // Its work is done, out of sight.
+    } catch {} // A request this process cannot carry out changes nothing.
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/${secret}`;
+  // A room out of sight is a row short, so going back to it is a resize, after which pi draws it whole.
+  const fit = () => rooms.forEach(({ term }, name) => term.resize(process.stdout.columns, Math.max(1, process.stdout.rows - (name === shown ? 0 : 1))));
+  const close = (name) => {
+    rooms.get(name)?.term.kill();
+    rooms.delete(name);
+  };
+  const quit = (code) => {
+    [...rooms.keys()].forEach(close);
+    // Each pi set the terminal's keyboard mode as it started, and only the rooms that ended in sight set it back.
+    process.stdout.write(`${started > seen ? `\x1b[<${started - seen}u` : ""}\x1b[?2004l\x1b[>4;0m\x1b[?25h`, () => process.exit(code));
+  };
+  function show(name) {
+    if (name === shown || !rooms.has(name)) return;
+    const left = shown;
+    shown = name;
+    if (left !== HANDLER && rooms.get(left)?.busy === false) close(left); // What it did is in its session.
+    if (left) process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+    fit();
+  }
+  function start(name, piArgs, cwd) {
+    const term = pty.spawn(process.execPath, [PI, "-e", EXTENSION, "-e", DRAWING, ...piArgs], {
+      name: process.env.TERM || "xterm-256color", cols: process.stdout.columns, rows: process.stdout.rows, cwd,
+      env: { ...process.env, BOTMODE_ROOMS: url, BOTMODE_ROOM: name },
+    });
+    started++;
+    rooms.set(name, { term, busy: false });
+    term.onData((data) => name === shown && process.stdout.write(data));
+    term.onExit(({ exitCode }) => {
+      if (rooms.get(name)?.term !== term) return; // Closed by this process.
+      rooms.delete(name);
+      if (name === shown) seen++;
+      if (name === HANDLER) quit(exitCode);
+      else if (name === shown) show(HANDLER);
+    });
+  }
+  try {
+    start(HANDLER, args, process.cwd());
+  } catch {
+    server.close();
+    return openHandler(args);
+  }
+  show(HANDLER);
+  process.stdin.setRawMode(true);
+  process.stdin.setEncoding("utf8");
+  // pi suspends itself on Ctrl+Z, which in a room would only freeze it, out of your shell's reach.
+  process.stdin.on("data", (data) => (data !== "\x1a" || process.platform === "win32") && rooms.get(shown)?.term.write(data));
+  if (process.platform === "win32") { // As pi does, so that keys such as Shift+Tab reach a room whole.
+    const tui = await import(pathToFileURL(createRequire(PI).resolve("@earendil-works/pi-tui")).href).catch(() => undefined);
+    tui?.getNativeClipboard()?.enableVirtualTerminalInput?.();
+  }
+  process.stdout.on("resize", fit);
+}
+
 const commands = { setup, invite, status, teardown, update, restart, host: (port) => serve(Number(port) || PORT), help: () => say(HELP) };
 const [command, ...rest] = process.argv.slice(2);
-if (!Object.hasOwn(commands, command)) openHandler(process.argv.slice(2));
+if (!Object.hasOwn(commands, command)) await openWindow(process.argv.slice(2));
 else {
   try {
     await commands[command](...rest);

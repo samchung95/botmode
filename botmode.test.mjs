@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -103,7 +104,8 @@ test("the handler hands work out and carries on; the reply arrives later as a me
     assert.match(await handler.call("handoff", { bot: "research", session: "continue", task: "slow: find sources" }), /research is working on it/);
     assert.equal(handler.sent.length, 0);
     await until(() => handler.sent.length);
-    assert.match(handler.sent[0].content, /^research replied:\nresearch heard: \[Handed over by Handler on pc\]\nslow: find sources$/);
+    // The bot learns where to reach the session that handed it the task.
+    assert.match(handler.sent[0].content, /^research replied:\nresearch heard: \[Handed over by Handler on pc, who gets your reply when you finish; to ask or tell them something before then, message handler\]\nslow: find sources$/);
     assert.equal(handler.sent[0].triggerTurn, true);
   } finally {
     handler.close();
@@ -291,6 +293,50 @@ test("leaving a session at work leaves it working: it carries on without you, an
   }
 });
 
+test("in rooms, the lobby opens a session in a room of its own and never stops the one you leave", async () => {
+  const asked = []; // What the rooms (the botmode command) hear from this window's pis.
+  const rooms = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    asked.push(JSON.parse(body));
+    res.end();
+  });
+  await once(rooms.listen(0, "127.0.0.1"), "listening");
+  process.env.BOTMODE_ROOMS = `http://127.0.0.1:${rooms.address().port}/secret`;
+  process.env.BOTMODE_ROOM = "handler";
+  const opened = () => asked.filter((message) => message.open);
+  const said = () => asked.filter((message) => message.room === "research.2" && !message.open).at(-1);
+  const handler = await open();
+  let copy;
+  try {
+    handler.ctx.isIdle = () => false; // Your handler is mid-reply as you open research.2.
+    handler.ctx.ui.select = async (_title, options) => options.find((option) => option.startsWith("research.2 "));
+    await handler.commands.sessions.handler("", handler.ctx);
+    assert.deepEqual(handler.switched, []); // This pi stays on your conversation, at work.
+    assert.deepEqual(opened(), [{ room: "handler", busy: true, open: "research.2",
+      args: ["--session-dir", path.join(HOME, "sessions"), "--session", fileOf("research.2")], cwd: path.join(HOME, "bots", "research") }]);
+    // research.2's room: you talk with research.2, and the lobby takes you back to your handler's room.
+    process.env.BOTMODE_ROOM = "research.2";
+    copy = await open("research.2", { window: true });
+    assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "x" }), /research\.2 is busy \(open in your window\)/);
+    copy.ctx.ui.select = async (_title, options) => options[0];
+    await copy.commands.sessions.handler("", copy.ctx);
+    assert.deepEqual(copy.switched, []);
+    assert.deepEqual(opened().at(-1), { room: "research.2", busy: false, open: "handler" });
+    // A room says when its work starts and ends, so the rooms keep it while it works and close it once it is done.
+    copy.ctx.isIdle = () => false;
+    await until(() => said()?.busy);
+    copy.ctx.isIdle = () => true;
+    await until(() => said().busy === false);
+  } finally {
+    delete process.env.BOTMODE_ROOMS;
+    delete process.env.BOTMODE_ROOM;
+    rooms.close();
+    handler.close();
+    copy?.close();
+  }
+});
+
 test("bots take colours in turn, copies share their bot's, and the colours go round again", () => {
   assert.equal(colourOf("research.2"), colourOf("research"));
   assert.notEqual(colourOf("handler"), colourOf("research"));
@@ -309,6 +355,17 @@ test("handoffs refuse the handler, cycles, long chains and empty tasks", () => {
   assert.match(refusal(config, ["pc/handler", "pc/a", "pc/b"], "a", "go"), /a is already working on this request \(pc\/handler -> pc\/a -> pc\/b\)/);
   assert.match(refusal(config, ["pc/handler", "pc/a", "pc/b"], "c", "go"), new RegExp(`stop ${MAX_CHAIN} bots deep`));
   assert.match(refusal(config, ["pc/handler"], "a", " "), /task is empty/);
+  assert.equal(refusal(config, ["pc/handler"], "pc/a", "go"), ""); // pc/a, on pc, is the a here.
+});
+
+test("a bot that waits in handoff for the reply is reached only by the reply, so it asks for questions in it", async () => {
+  const research = await open("research"); // research's own pi, at work.
+  try {
+    assert.equal(await research.call("handoff", { bot: "b", session: "continue", task: "go" }),
+      "b replied:\nb heard: [Handed over by Researcher on pc, who waits for your reply; put any question in it]\ngo");
+  } finally {
+    research.close();
+  }
 });
 
 test("only the owner sets hosts, and a host's bots join the team over HTTP", async () => {
@@ -323,9 +380,11 @@ test("only the owner sets hosts, and a host's bots join the team over HTTP", asy
     assert.deepEqual(teams.self.bots.map((bot) => bot.id), ["research", "a", "b", "c"]);
     assert.match(teamPrompt(config, "handler", teams), /- self\/a \(a\): a/);
     assert.match(teamPrompt(config, "handler", { self: { bots: [], working: [{ id: "a.2", task: "go" }] } }), /- self\/a\.2: go/);
-    // A worker on another machine never reaches this machine's handler, by message either.
-    assert.equal((await (await callHost(config.hosts.self.url, "message", { to: "handler", from: "mac/a", text: "hi" })).json()).text,
-      "Refused: only your handler messages pc's handler.");
+    // A worker on another machine reaches this machine's handler, by message, only while at work on a task from it.
+    for (const chain of [undefined, ["pc/handler", "mac/b"]]) {
+      assert.equal((await (await callHost(config.hosts.self.url, "message", { to: "handler", from: "mac/a", text: "hi", chain })).json()).text,
+        "Refused: pc's handler hears only from your handler, and from bots at work on a task it handed them.");
+    }
     assert.equal(refusal(config, ["pc/handler"], "self/a", "go"), "");
     assert.match(refusal(config, ["pc/handler"], "nas/a", "go"), /no host 'nas'/);
     // Handlers talk to each other's machines, directly; workers never reach a handler.
@@ -367,6 +426,14 @@ test("only the owner sets hosts, and a host's bots join the team over HTTP", asy
       await until(() => window.sent.length);
       assert.equal(window.sent[0].content, "[Message from mac/handler; answer with message to mac/handler]\nset up the bots");
       assert.deepEqual(window.sent[0].details, { from: "mac/handler" }); // Drawn in mac/handler's colour.
+      // A bot on another machine is told to reach the window at pc/handler, which takes its messages while it works for it.
+      assert.match(await window.call("handoff", { bot: "self/a", session: "fresh", task: "slow: go" }), /working on it in the background/);
+      await until(() => window.sent.length > 1);
+      assert.match(window.sent[1].content, /heard: \[Handed over by Handler on pc, who gets your reply when you finish; to ask or tell them something before then, message pc\/handler\]\nslow: go$/);
+      assert.equal((await (await callHost(config.hosts.self.url, "message", { to: "handler", from: "mac/a", text: "hi", chain: ["pc/handler"] })).json()).text,
+        "Sent to handler.");
+      await until(() => window.sent.length > 2);
+      assert.equal(window.sent[2].content, "[Message from mac/a; answer with message to mac/a]\nhi");
     } finally {
       window.close();
       setHost("self", null);

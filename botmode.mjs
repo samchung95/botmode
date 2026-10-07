@@ -128,10 +128,10 @@ const isWebUrl = (url) => typeof url === "string" && URL.canParse(url) && /^http
 const result = (text) => ({ content: [{ type: "text", text }], details: {} });
 const reason = (error) => error.cause?.message || error.message; // fetch says only "fetch failed"; the cause says why.
 
-/** "host/bot" -> ["host", "bot"]; a bot on this machine has no host. */
+/** "host/bot" -> ["host", "bot"]; a bot on this machine has no host, even when named with this machine's. */
 function address(target) {
   const at = target.indexOf("/");
-  return at < 0 ? [undefined, target] : [target.slice(0, at), target.slice(at + 1)];
+  return at < 0 || target.slice(0, at) === MACHINE ? [undefined, target.slice(at + 1)] : [target.slice(0, at), target.slice(at + 1)];
 }
 
 const botOf = (session) => session.replace(/\.\d+$/, "");
@@ -622,7 +622,7 @@ async function readJson(req) {
 /**
  * A request from one of your machines, which all hold the token. GET /bots lists this machine's bots and its sessions at work.
  * POST /handoff {bot, prompt, chain} runs one and streams {steps} lines, then {ok, text}.
- * POST /message {to, from, text} leaves a message for a session at work here, or for the handler's window.
+ * POST /message {to, from, text, chain} leaves a message for a session at work here, or for the handler's window.
  * POST /join {name, url} and /leave {url} connect and disconnect a machine. POST /stop stops this host.
  */
 async function answer(req, res, secret, log) {
@@ -662,12 +662,14 @@ async function answer(req, res, secret, log) {
     return res.writeHead(200).end("{}\n", () => process.exit(0));
   }
   if (route === "POST /message") {
-    const { to, from, text } = await readJson(req);
+    const { to, from, text, chain } = await readJson(req);
     if (!(typeof to === "string" && typeof from === "string" && /^[^/\s]+\/[^/\s]+$/.test(from))) {
       return send(res, 400, { error: "expected {to, from: host/session, text}" });
     }
-    // As with handoffs, only another machine's handler reaches this machine's handler.
-    const refused = to === HANDLER && !from.endsWith(`/${HANDLER}`) ? `Refused: only your handler messages ${MACHINE}'s handler.`
+    // As with handoffs, only another machine's handler reaches this machine's handler; so does a bot doing a task from it.
+    const asked = Array.isArray(chain) && chain.at(-1) === `${MACHINE}/${HANDLER}`;
+    const refused = to === HANDLER && !from.endsWith(`/${HANDLER}`) && !asked
+      ? `Refused: ${MACHINE}'s handler hears only from your handler, and from bots at work on a task it handed them.`
       : undeliverable(to, from, text);
     if (!refused) post(to, { from, text });
     return send(res, 200, { ok: !refused, text: refused || `Sent to ${to}.` });
@@ -734,12 +736,17 @@ function post(box, message) {
   fs.renameSync(`${name}.tmp`, `${name}.json`); // Whole, or not there yet.
 }
 
+/** The files of the messages waiting in `box`, oldest first. */
+function letters(box) {
+  const dir = path.join(MAIL, box);
+  return fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith(".json")).sort().map((name) => path.join(dir, name)) : [];
+}
+
 /** Takes every message waiting in `box`, oldest first. */
 function takeMail(box) {
-  const dir = path.join(MAIL, box);
-  return (fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith(".json")).sort() : []).map((name) => {
-    const message = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8"));
-    fs.rmSync(path.join(dir, name));
+  return letters(box).map((file) => {
+    const message = JSON.parse(fs.readFileSync(file, "utf-8"));
+    fs.rmSync(file);
     return message;
   });
 }
@@ -756,7 +763,8 @@ async function deliver(config, target, from, text, signal) {
   }
   if (!Object.hasOwn(config.hosts ?? {}, host)) return { ok: false, text: `Refused: there is no host '${host}'.` };
   try {
-    const sent = await (await callHost(config.hosts[host].url, "message", { to, from: `${MACHINE}/${from}`, text }, signal)).json();
+    // With the chain it works for, so the handler that handed it its task takes its messages.
+    const sent = await (await callHost(config.hosts[host].url, "message", { to, from: `${MACHINE}/${from}`, text, chain: ABOVE }, signal)).json();
     return { ok: sent.ok, text: sent.ok ? `Sent to ${target}.` : sent.text };
   } catch (error) {
     return { ok: false, text: `${host}: ${reason(error)}` };
@@ -804,8 +812,13 @@ function tell(to, text) {
 }
 
 export default function botmode(pi) {
-  let timer, watching, left;
+  let timer, watching, left, beat;
   const waiting = new Map(); // address -> resolves message's wait with that address's next message.
+  // Set when the botmode command runs your window as rooms, a pi per conversation (cli.mjs): where it listens, and this room.
+  const [rooms, room] = [process.env.BOTMODE_ROOMS, process.env.BOTMODE_ROOM];
+  const toRooms = (message) => fetch(rooms, { method: "POST", body: JSON.stringify({ room, ...message }) }).then(() => {}, () => {});
+  // Replying, waiting on a bot it handed work to, or about to read a message: a room that is busy is kept out of sight.
+  const busy = (ctx, box) => !ctx.isIdle() || shared.running.size > 0 || Boolean(box && letters(box).length);
 
   /** Applies this bot's tools and model from the configuration: at start, and when the handler changes itself. */
   async function applySelf(ctx) {
@@ -836,6 +849,8 @@ export default function botmode(pi) {
   pi.on("session_start", async (_event, ctx) => {
     const { session, box } = whoAmI(ctx);
     const file = ctx.sessionManager.getSessionFile();
+    // A bot session you open is yours while it is open: no handoff runs in it.
+    if (ctx.hasUI && session && claim(session, "open in your window")) shared.entered.add(session);
     // A session that another pi works in, a bot's or your handler's own carrying on without you: this window only shows
     // it, writes nothing to it and leaves its mail alone.
     const atWork = () => session ? holder(session) : [...shared.running].some((run) => run.file === file);
@@ -846,6 +861,14 @@ export default function botmode(pi) {
       timer.unref(); // A worker's pi exits when its task is done, whatever is still scheduled.
     }
     if (!ctx.hasUI) return;
+    if (rooms) {
+      let was = false;
+      beat = setInterval(() => {
+        const now = busy(ctx, !watching && box);
+        if (now !== was) toRooms({ busy: was = now });
+      }, 500);
+      beat.unref();
+    }
     if (!session) {
       shared.home = file;
       fs.mkdirSync(HOME, { recursive: true });
@@ -881,6 +904,7 @@ export default function botmode(pi) {
 
   pi.on("session_shutdown", (event, ctx) => {
     clearInterval(timer);
+    clearInterval(beat);
     shared.render = undefined;
     const { session } = whoAmI(ctx);
     // ponytail: with two windows open, the first to leave its handler's conversation sends the rest headless; track pids if that bites.
@@ -936,7 +960,11 @@ export default function botmode(pi) {
       const chain = [...ABOVE, `${MACHINE}/${me.bot}`];
       const refused = refusal(config, chain, params.bot, params.task);
       if (refused) return result(refused);
-      const prompt = `[Handed over by ${config.bots[me.bot].name} on ${MACHINE}]\n${params.task}`;
+      // Where the bot reaches this session. A bot's own pi waits in handoff, and reads its messages only once the reply is in.
+      const box = me.box ?? HANDLER;
+      const reach = !ctx.hasUI ? "who waits for your reply; put any question in it" : "who gets your reply when you finish; to ask or " +
+        `tell them something before then, message ${address(params.bot)[0] === undefined ? box : `${MACHINE}/${box}`}`;
+      const prompt = `[Handed over by ${config.bots[me.bot].name} on ${MACHINE}, ${reach}]\n${params.task}`;
       const how = { session: params.session, folder: params.folder };
       if (!ctx.hasUI) { // A worker's pi ends with its turn, so it waits for the reply.
         const outcome = await handOver(config, params.bot, how, prompt, chain, signal, (steps) => onUpdate?.(result(steps)));
@@ -1002,21 +1030,27 @@ export default function botmode(pi) {
   });
 
   /**
+   * Opens session `name`, kept in `file`, in this window. In rooms a session other than this one gets a room of its own,
+   * started in `cwd`, and this one stays as it is, out of sight; without rooms pi opens it in place of this one.
+   */
+  function enter(ctx, name, file, cwd) {
+    const me = whoAmI(ctx);
+    if (!rooms || name === (me.session ?? HANDLER)) return ctx.switchSession(file);
+    if (cwd && !isFolder(cwd)) throw new Error(`its folder ${cwd} is gone`);
+    return toRooms({ busy: busy(ctx, me.box), open: name, ...(cwd && { args: ["--session-dir", SESSIONS, "--session", file], cwd }) });
+  }
+
+  /**
    * Opens a bot session in this window: an idle one to talk with, and no handoff runs in it while it is open there; one at
    * work to watch, which the window takes over once the bot is done. The session you leave carries on if it is at work.
    */
   async function focus(ctx, session) {
     const file = sessionFiles().get(session);
     if (!file) return watch(ctx, session, holder(session)?.task); // A new copy has no session to show before its first step.
-    const entering = claim(session, "open in your window");
-    if (entering) shared.entered.add(session);
-    const switched = await ctx.switchSession(file).catch((error) => { // pi refuses a session whose folder is gone.
+    try {
+      await enter(ctx, session, file, folderOf(loadConfig(), session, file));
+    } catch (error) { // pi refuses a session whose folder is gone.
       ctx.ui.notify(`${session}: ${reason(error)}`, "error");
-      return { cancelled: true };
-    });
-    if (switched.cancelled && entering) {
-      shared.entered.delete(session);
-      release(session);
     }
   }
 
@@ -1040,11 +1074,11 @@ export default function botmode(pi) {
       const busy = new Map(working().map((session) => [session.id, session.task]));
       const files = sessionFiles();
       const id = args.trim();
-      if (id === HANDLER) return ctx.switchSession(shared.home); // Your handler's conversation.
+      if (id === HANDLER) return enter(ctx, HANDLER, shared.home); // Your handler's conversation.
       if (id) return files.has(id) || busy.has(id) ? focus(ctx, id) : ctx.ui.notify(`There is no session ${id} here.`, "warning");
       const homeAtWork = [...shared.running].some((run) => run.file === shared.home);
       const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}${homeAtWork ? " · working" : ""}`,
-        () => here ? ctx.switchSession(shared.home) : watching && watch(ctx, HANDLER)]]);
+        () => here ? enter(ctx, HANDLER, shared.home) : watching && watch(ctx, HANDLER)]]);
       for (const session of new Set([...files.keys(), ...busy.keys()])) {
         // handler here is another machine's handler talking with this one, not a bot of yours; skip removed bots too.
         if (session === HANDLER || !Object.hasOwn(config.bots, botOf(session))) continue;
