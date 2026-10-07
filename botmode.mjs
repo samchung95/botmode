@@ -26,6 +26,12 @@ const ABOVE = (process.env.BOTMODE_CHAIN || "").split(",").filter(Boolean); // m
 const SELF = fileURLToPath(import.meta.url);
 // pi's entry script. Inside pi it is process.argv[1]; the `botmode` command sets BOTMODE_PI after importing this file.
 const piEntry = () => process.env.BOTMODE_PI || process.argv[1];
+// Claude Code, which bots with "agent": "claude" work in: the `botmode` command sets BOTMODE_CLAUDE to the one it comes with.
+const claudeCommand = () => {
+  const command = process.env.BOTMODE_CLAUDE || "claude";
+  return /\.m?js$/.test(command) ? [process.execPath, command] : [command]; // A script stands in for it in the tests.
+};
+const BRIDGE = fileURLToPath(new URL("botmode-claude.mjs", import.meta.url)); // A Claude Code bot's way to the team.
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const SECTIONS = ["defaults", "bots", "hosts"];
 
@@ -41,10 +47,13 @@ const BOT_FIELDS = {
   description: ["string", true], // What the bot does; other bots route by it.
   title: ["string", false],
   instructions: ["string", false],
-  model: ["string", false], // provider/model[:thinking]; empty uses defaults.model, then pi's default.
+  agent: ["string", false], // "claude" runs the bot in Claude Code; omitted, or "pi", in pi.
+  model: ["string", false], // provider/model[:thinking]; empty uses defaults.model, then pi's default. In Claude Code, its model.
   tools: ["list", false], // pi tool names; omitted keeps pi's defaults, [] leaves only the team tools.
   workspace: ["string", false], // An existing absolute folder; omitted gives the bot a folder of its own.
+  archived: ["list", false], // Its sessions out of the lobby and away from handoffs; its own id archives the whole bot.
 };
+const AGENTS = ["pi", "claude"];
 // All of pi's tools: files and the terminal, with the rights of the account Botmode runs as.
 export const ALL_TOOLS = ["read", "bash", ...(process.platform === "win32" ? ["powershell"] : []), "edit", "write", "grep", "find", "ls"];
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"]; // What pi turns on when a bot names no tools.
@@ -63,7 +72,11 @@ export const DEFAULT = {
 const FIELDS = "Bot fields: name and description (required; the description is what routing reads), title, instructions, " +
   "model ('provider/model' or 'provider/model:thinking'; empty uses defaults.model), tools (pi tool names: " +
   `${ALL_TOOLS.join(", ")}; omitted keeps pi's defaults, [] leaves only the team tools), workspace (an existing ` +
-  "absolute folder; omitted gives the bot its own folder). Ids are lowercase slugs. hosts lists the owner's other " +
+  "absolute folder; omitted gives the bot its own folder), agent ('claude' makes it a coding bot that works in Claude " +
+  "Code, with all of Claude Code's tools and no permission prompts; its model is a Claude Code model such as opus or " +
+  "sonnet, empty for Claude Code's default; it has no tools field), archived (sessions of the bot that leave the lobby and " +
+  "take no handoffs: the bot's own id archives the whole bot, off the team with its copies, and a copy's id, such as " +
+  "research.2, only that copy; drop one from the list to bring it back as it was). Ids are lowercase slugs. hosts lists the owner's other " +
   "machines, whose bots join the team as host/bot; only the owner sets hosts, in config.json.";
 
 // pi loads this file afresh for every session it opens, so what must outlive one lives here: the bots this process runs
@@ -134,7 +147,7 @@ function address(target) {
   return at < 0 || target.slice(0, at) === MACHINE ? [undefined, target.slice(at + 1)] : [target.slice(0, at), target.slice(at + 1)];
 }
 
-const botOf = (session) => session.replace(/\.\d+$/, "");
+export const botOf = (session) => session.replace(/\.\d+$/, "");
 const lockOf = (session) => path.join(SESSIONS, `${session}.lock`);
 
 /** The {pid, task} of the live process running `session`, if one is. */
@@ -154,7 +167,7 @@ function holder(session) {
 }
 
 /** Marks `session` busy, for every process on this machine; false when a live one already has it. */
-function claim(session, task) {
+export function claim(session, task) {
   fs.mkdirSync(SESSIONS, { recursive: true });
   if (holder(session)) return false;
   // ponytail: two processes clearing the same dead lock at once could both claim it; lock with a rename if that bites.
@@ -168,7 +181,8 @@ function claim(session, task) {
   }
 }
 
-const release = (session) => fs.rmSync(lockOf(session), { force: true });
+export const release = (session) => fs.rmSync(lockOf(session), { force: true });
+export const OPEN = "open in your window"; // The task of a bot session you have open: no handoff runs in it meanwhile.
 
 /** Whether your handler's conversation is open in a window on this machine, where its messages reach it. */
 function windowOpen() {
@@ -225,18 +239,26 @@ function folderOf(config, session, file = sessionFiles().get(session)) {
   return session === bot || !file ? own : startedIn(file) ?? own;
 }
 
-/** The folder a session started in, which pi keeps in the first line of its file. */
-function startedIn(file) {
+/**
+ * The first line of a session's file: pi's header, with the folder it started in. A bot in Claude Code has a file that
+ * holds only this line, with its conversation's id in Claude Code as `claude`.
+ */
+function header(file) {
   const head = Buffer.alloc(64 * 1024);
   const fd = fs.openSync(file, "r");
   try {
-    const { cwd } = JSON.parse(head.toString("utf-8", 0, fs.readSync(fd, head)).split("\n", 1)[0]);
-    return typeof cwd === "string" && cwd ? cwd : undefined;
+    return JSON.parse(head.toString("utf-8", 0, fs.readSync(fd, head)).split("\n", 1)[0]) ?? {};
   } catch {
-    return undefined;
+    return {};
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** The folder a session started in. */
+function startedIn(file) {
+  const { cwd } = header(file);
+  return typeof cwd === "string" && cwd ? cwd : undefined;
 }
 
 /** RFC 7386: objects merge recursively, null deletes a key, any other value replaces. */
@@ -289,6 +311,13 @@ export function problems(config) {
       }
     }
     if (Array.isArray(bot.tools) && !bot.tools.every((tool) => typeof tool === "string" && tool)) found.push(`${where}.tools must list tool names`);
+    if (typeof bot.agent === "string" && !AGENTS.includes(bot.agent)) found.push(`${where}.agent must be "pi" or "claude"`);
+    if (bot.agent === "claude" && id === HANDLER) found.push(`${where}.agent: the handler works in pi`);
+    if (bot.agent === "claude" && bot.tools !== undefined) found.push(`${where}.tools: a bot in Claude Code has Claude Code's tools`);
+    if (bot.archived !== undefined && id === HANDLER) found.push(`${where}.archived: the handler cannot be archived`);
+    else if (Array.isArray(bot.archived) && !bot.archived.every((session) => typeof session === "string" && SESSION_ID.test(session) && botOf(session) === id)) {
+      found.push(`${where}.archived must list ${id} or its copies, such as ${id}.2`);
+    }
     if (typeof bot.workspace === "string" && !(path.isAbsolute(bot.workspace) && isFolder(bot.workspace))) {
       found.push(`${where}.workspace must be an existing absolute folder`);
     }
@@ -321,12 +350,19 @@ export function applyPatch(patch) {
   return found;
 }
 
+/** Whether `session` is archived, alone or with its whole bot. */
+const archived = (config, session) => (config.bots[botOf(session)]?.archived ?? []).some((entry) => entry === session || entry === botOf(session));
+
+/** Whether the lobby lists `session`: one of your bots', and not archived. */
+const inLobby = (config, session) => session !== HANDLER && Object.hasOwn(config.bots, botOf(session)) && !archived(config, session);
+
 /** Why `chain` may not hand `task` to `target`, or "" when it may. A host checks again against its own team. */
 export function refusal(config, chain, target, task) {
   const [host, session] = address(target);
   const bot = SESSION_ID.test(session) ? botOf(session) : session;
   const hosts = Object.keys(config.hosts ?? {});
-  const bots = Object.keys(config.bots).filter((id) => id !== HANDLER);
+  const bots = Object.keys(config.bots).filter((id) => id !== HANDLER && !archived(config, id));
+  if (host === undefined && archived(config, session)) return `Refused: ${target} is archived. Bots: ${bots.join(", ") || "none"}`;
   if (host !== undefined && !hosts.includes(host)) return `Refused: there is no host '${host}'. Hosts: ${hosts.join(", ") || "none"}`;
   // A handler takes work only from another machine's handler, directly, so a worker never steers a bot that has configure.
   const handlerAsks = chain.length === 1 && chain[0].endsWith(`/${HANDLER}`) && (host !== undefined || chain[0] !== `${MACHINE}/${HANDLER}`);
@@ -346,14 +382,14 @@ const line = (id, bot) => `- ${id} (${bot.name}${bot.title ? `, ${bot.title}` : 
 
 /**
  * `remote` maps each host to {bots, working}, or to why they are unavailable; `busy` lists this machine's sessions at work,
- * as working() returns them.
+ * as working() returns them, and `sessions` all its sessions, which the handler sees so it can archive them.
  */
-export function teamPrompt(config, id, remote = {}, busy = []) {
+export function teamPrompt(config, id, remote = {}, busy = [], sessions = []) {
   const bot = config.bots[id];
   const identity = `You are ${bot.name}${bot.title ? `, ${bot.title}` : ""}. ${bot.description}`;
   const reachable = Object.entries(remote).filter(([, team]) => typeof team !== "string");
   const roster = [
-    ...Object.entries(config.bots).filter(([other]) => other !== id && other !== HANDLER).map(([other, entry]) => line(other, entry)),
+    ...Object.entries(config.bots).filter(([other]) => other !== id && other !== HANDLER && !archived(config, other)).map(([other, entry]) => line(other, entry)),
     ...Object.entries(remote).flatMap(([host, team]) => typeof team === "string" ? [`- ${host}/…: unavailable right now (${team})`] : [
       ...(id === HANDLER ? [`- ${host}/${HANDLER}: the handler on ${host}. Ask it about that machine, or to create or change bots there.`] : []),
       ...team.bots.map((entry) => line(`${host}/${entry.id}`, entry)),
@@ -367,14 +403,19 @@ export function teamPrompt(config, id, remote = {}, busy = []) {
       "its reply reaches you later as a message, so hand independent tasks out together and they run in parallel. Bots " +
       "may message you with questions; answer with message, asking the owner first when only the owner knows. When the " +
       `owner asks to change the team, including you (bots.${HANDLER}: your tools, model and instructions), change it with ` +
-      "configure and confirm what changed. When no bot fits recurring work, offer to create one."
+      "configure and confirm what changed. When no bot fits recurring work, offer to create one, and offer to archive bots " +
+      "and copies whose work is done."
     : "You are one bot on a team. When a task, or part of one, fits another bot's description better than yours, hand it " +
       "over with handoff and use its reply. Bots at work can be reached with message: share what they need, or ask; " +
       "when only the owner can decide, message handler and wait for the answer.";
   const team = reachable.length ? "Team (a host/bot id is a bot on another of the owner's machines)" : "Team";
   const parts = [identity, bot.instructions, role, `${team}:\n${roster || "(no other bots yet)"}`,
     atWork && `Working right now (reach them with message):\n${atWork}`];
-  if (id === HANDLER) parts.push(`Current configuration:\n${JSON.stringify(config, null, 2)}\n${FIELDS}`);
+  if (id === HANDLER) {
+    const listed = sessions.filter((session) => inLobby(config, session));
+    parts.push(listed.length && `Bot sessions on this machine: ${listed.join(", ")}`,
+      `Current configuration:\n${JSON.stringify(config, null, 2)}\n${FIELDS}`);
+  }
   return parts.filter(Boolean).join("\n\n");
 }
 
@@ -385,41 +426,87 @@ const oneLine = (text, size = 100) => {
 const textOf = (content) => typeof content === "string" ? content
   : (content ?? []).filter((block) => block?.type === "text").map((block) => block.text ?? "").join("");
 
+/** Starts a session's file as pi names them, <time>_<session>.jsonl, with `fields` in its first line. */
+function newFile(session, fields) {
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}_${session}.jsonl`;
+  fs.writeFileSync(path.join(SESSIONS, name), `${JSON.stringify({ type: "session", ...fields })}\n`);
+}
+
 /**
- * Runs one turn of `target`, a bot or a copy such as research.2, in a child pi. `how.session` (see START) picks its
- * session, and `how.folder`, for a new copy only, where that copy works from then on; it defaults to the folder of `target`.
- * Reports its steps through onProgress and resolves to {ok, text, session}.
+ * How Claude Code runs `session` for the team, before the flags that pick its conversation: with no permission prompts, as
+ * its bot with the team's prompt, and with handoff and message from botmode-claude.mjs, which also hands it its messages
+ * after each step. ← on an empty prompt edits, as everywhere else, instead of opening Claude Code's agents: the lobby is ours.
+ * The team's tools are its only MCP tools, and Claude Code's own messages to the owner's other Claude Code sessions are off.
  */
-function runBot(config, target, how, prompt, chain, signal, onProgress) {
+async function claudeArgs(config, session, chain) {
+  const bot = config.bots[botOf(session)];
+  const bridge = (mode) => `node "${BRIDGE.replaceAll("\\", "/")}" ${mode} ${session}`; // Claude Code runs these in a shell.
+  const settings = { leftArrowOpensAgents: false, statusLine: { type: "command", command: bridge("status") },
+    hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: bridge("mail") }] }] } };
+  // All the bridge needs to work for this session on this machine, whatever Claude Code passes on of its own.
+  const env = { BOTMODE_HOME: HOME, BOTMODE_MACHINE: MACHINE, BOTMODE_PI: piEntry(), BOTMODE_CHAIN: chain.join(","),
+    ...(process.env.BOTMODE_CLAUDE && { BOTMODE_CLAUDE: process.env.BOTMODE_CLAUDE }) };
+  const servers = { mcpServers: { botmode: { type: "stdio", command: process.execPath, args: [BRIDGE, "mcp", session], env } } };
+  const team = `${teamPrompt(config, botOf(session), await remoteTeams(config), working())}\n\nhandoff and message are your ` +
+    "mcp__botmode__handoff and mcp__botmode__message tools; they are your only way to the team.";
+  return ["--permission-mode", "bypassPermissions", "--settings", JSON.stringify(settings), "--mcp-config", JSON.stringify(servers),
+    "--strict-mcp-config", "--disallowedTools", "SendMessage,ListAgents", "--append-system-prompt", team, ...(bot.model ? ["--model", bot.model] : [])];
+}
+
+/**
+ * Runs one turn of `target`, a bot or a copy such as research.2, in a child pi, or Claude Code for a bot with agent "claude".
+ * `how.session` (see START) picks its session, and `how.folder`, for a new copy only, where that copy works from then on; it
+ * defaults to the folder of `target`. Reports its steps through onProgress and resolves to {ok, text, session}.
+ */
+async function runBot(config, target, how, prompt, chain, signal, onProgress) {
   const bot = botOf(target);
   const task = oneLine(prompt.replace(/^\[Handed over by [^\]\n]*\]\s*/, ""), 80);
   if (how.folder !== undefined && how.session === "continue") {
-    return Promise.resolve({ ok: false, text: `${target} keeps its folder. Name a folder only with session "fresh" or "copy", for a new copy.` });
+    return { ok: false, text: `${target} keeps its folder. Name a folder only with session "fresh" or "copy", for a new copy.` };
   }
   if (how.folder !== undefined && !(path.isAbsolute(how.folder) && fs.statSync(how.folder, { throwIfNoEntry: false })?.isDirectory())) {
-    return Promise.resolve({ ok: false, text: `${how.folder} is not a folder on ${MACHINE}; name the absolute path of one that exists.` });
+    return { ok: false, text: `${how.folder} is not a folder on ${MACHINE}; name the absolute path of one that exists.` };
   }
   const cwd = how.folder === undefined ? folderOf(config, target) : path.resolve(how.folder);
   let session = target, fork;
   if (how.session === "continue") {
     if (!claim(target, task)) {
-      return Promise.resolve({ ok: false, text: `${target} is busy (${holder(target)?.task ?? "just finishing"}). Hand it over with session ` +
-        '"fresh" or "copy" to run a copy beside it, or wait for its reply.' });
+      return { ok: false, text: `${target} is busy (${holder(target)?.task ?? "just finishing"}). Hand it over with session ` +
+        '"fresh" or "copy" to run a copy beside it, or wait for its reply.' };
     }
   } else {
     fork = how.session === "copy" ? sessionFiles().get(target) : undefined; // A bot that has never run has nothing to copy.
     session = claimCopy(bot, task);
   }
-  fs.mkdirSync(cwd, { recursive: true });
-  return work({ name: session, args: ["--session-dir", SESSIONS, "--session-id", session], fork, cwd, chain, signal, onProgress }, prompt)
-    .finally(() => release(session));
+  try {
+    fs.mkdirSync(cwd, { recursive: true });
+    if (config.bots[bot]?.agent !== "claude") {
+      const args = ["--session-dir", SESSIONS, "--session-id", session];
+      return await work({ name: session, args, first: fork && [...args, "--fork", fork], cwd, chain, signal, onProgress }, prompt);
+    }
+    // Claude Code goes on with the session's conversation, or starts one, as a copy of `fork`'s when there is one.
+    const file = sessionFiles().get(session);
+    const known = file && header(file).claude, from = fork && header(fork).claude;
+    const id = known || crypto.randomUUID();
+    const team = await claudeArgs(config, session, chain);
+    const outcome = await work({ name: session, claude: true, args: [...team, "--resume", id], cwd, chain, signal, onProgress,
+      first: !known && [...team, ...(from ? ["--resume", from, "--fork-session"] : []), "--session-id", id],
+      // Only once Claude Code has the conversation, so the next turn never asks for one it does not have.
+      onStart: !known && (() => newFile(session, { cwd, claude: id })) }, prompt);
+    const now = new Date();
+    if (sessionFiles().has(session)) fs.utimesSync(sessionFiles().get(session), now, now); // The lobby's "idle · 5m ago".
+    return outcome;
+  } finally {
+    release(session);
+  }
 }
 
 /**
- * Works in a session, which `args` name to pi, through child pis: a turn on `prompt`, the first forked from `fork` when
- * given, then a turn on any messages that came for `name` as it finished. Resolves to {ok, text, session}.
+ * Works in a session through child pis, or Claude Codes: a turn on `prompt`, then a turn on any messages that came for
+ * `name` as it finished. `args` name the session to them, and `first`, when given, does instead in the first turn.
+ * `onStart` runs as Claude Code first answers. Resolves to {ok, text, session}.
  */
-function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt) {
+function work({ name, args, first, claude, onStart, cwd, chain, signal, onProgress, file }, prompt) {
   const stop = new AbortController();
   signal?.addEventListener("abort", () => stop.abort(), { once: true });
   const run = { name, file, steps: "", stop: () => stop.abort() };
@@ -431,17 +518,18 @@ function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt
     onProgress(run.steps, name);
   };
 
-  /** One pi run in the session, which ends with the bot's turn; resolves to {ok, text}. */
-  const turn = (text, fork) => new Promise((resolve) => {
-    const argv = [piEntry(), "--mode", "json", "-p", ...args, ...(fork ? ["--fork", fork] : []), "-e", SELF, text];
-    const child = spawn(process.execPath, argv, {
+  /** One run of pi, or Claude Code, in the session, which ends with the bot's turn; resolves to {ok, text}. */
+  const turn = (text, args) => new Promise((resolve) => {
+    const [command, ...argv] = claude ? [...claudeCommand(), "-p", "--output-format", "stream-json", "--verbose", ...args, text]
+      : [process.execPath, piEntry(), "--mode", "json", "-p", ...args, "-e", SELF, text];
+    const child = spawn(command, argv, {
       cwd, env: { ...process.env, BOTMODE_CHAIN: chain.join(",") }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
     // ponytail: kills the bot's pi, not processes its tools started; kill the tree if strays appear.
     const kill = () => child.kill();
     stop.signal.addEventListener("abort", kill, { once: true });
     const replies = [];
-    let buffer = "", errors = "", last;
+    let buffer = "", errors = "", last, done;
     const onLine = (line) => {
       let event;
       try {
@@ -458,6 +546,16 @@ function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt
           step(text);
         }
       }
+      // Claude Code's events: its steps, then the result of the turn.
+      for (const block of event.type === "assistant" ? event.message?.content ?? [] : []) {
+        if (block.type === "tool_use") step(`${block.name.replace(/^mcp__botmode__/, "")} ${oneLine(JSON.stringify(block.input ?? {}), 80)}`);
+        if (block.type === "text" && block.text?.trim()) step(block.text);
+      }
+      if (event.type === "result") done = event;
+      if (onStart && ["assistant", "result"].includes(event.type)) {
+        onStart();
+        onStart = undefined;
+      }
     };
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (data) => {
@@ -472,8 +570,13 @@ function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt
     child.on("close", (code) => {
       stop.signal.removeEventListener("abort", kill);
       if (buffer.trim()) onLine(buffer);
-      resolve(!last || last.stopReason === "error" || last.stopReason === "aborted"
-        ? { ok: false, text: last?.errorMessage || errors.trim() || `pi exited with code ${code}` } : { ok: true, text: replies.at(-1) ?? "" });
+      if (claude) {
+        resolve(done?.is_error === false ? { ok: true, text: done.result ?? "" }
+          : { ok: false, text: (typeof done?.result === "string" && done.result) || errors.trim() || `Claude Code exited with code ${code}` });
+      } else {
+        resolve(!last || last.stopReason === "error" || last.stopReason === "aborted"
+          ? { ok: false, text: last?.errorMessage || errors.trim() || `pi exited with code ${code}` } : { ok: true, text: replies.at(-1) ?? "" });
+      }
     });
   });
 
@@ -484,12 +587,12 @@ function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt
     let outcome = { ok: false, text: "Stopped before it started." }, next = prompt;
     try {
       for (let turns = 0; next && !stop.signal.aborted; turns++) {
-        outcome = await turn(next, turns ? undefined : fork);
+        outcome = await turn(next, (!turns && first) || args);
         if (!outcome.ok) break;
         replies.push(outcome.text);
         // pi ends with the bot's turn, so a message that came as it finished would wait for its next task: it gets a turn now.
         // ponytail: at most 3 such turns, so two bots answering each other's answers stop; the rest waits for the next task.
-        next = turns < 3 ? takeMail(name).map(mailText).join("\n\n") : "";
+        next = turns < 3 ? mailFor(name) : "";
       }
     } finally {
       shared.running.delete(run);
@@ -633,7 +736,7 @@ async function answer(req, res, secret, log) {
   const config = loadConfig();
   const route = `${req.method} ${req.url}`;
   if (route === "GET /bots") {
-    return send(res, 200, { bots: Object.entries(config.bots).filter(([id]) => id !== HANDLER)
+    return send(res, 200, { bots: Object.entries(config.bots).filter(([id]) => id !== HANDLER && !archived(config, id))
       .map(([id, bot]) => ({ id, name: bot.name, title: bot.title, description: bot.description })), working: working() });
   }
   if (route === "POST /join") {
@@ -753,6 +856,21 @@ function takeMail(box) {
 
 const mailText = ({ from, text, reply }) => reply ? text : `[Message from ${from}; answer with message to ${from}]\n${text}`;
 
+/** Takes the messages waiting in `box`, as the text a bot reads them in. */
+export const mailFor = (box) => takeMail(box).map(mailText).join("\n\n");
+
+/** Takes the next message from `from` to `box` as it comes, within WAIT; undefined when none comes. */
+async function nextFrom(box, from, signal) {
+  for (const end = Date.now() + WAIT; Date.now() < end && !signal?.aborted; await new Promise((resolve) => setTimeout(resolve, 500))) {
+    for (const file of letters(box)) {
+      const message = JSON.parse(fs.readFileSync(file, "utf-8"));
+      if (message.reply || message.from !== from) continue;
+      fs.rmSync(file, { force: true });
+      return message.text;
+    }
+  }
+}
+
 /** Sends `text` from `from`, a session on this machine, to `target`, a session here or host/session; resolves to {ok, text}. */
 async function deliver(config, target, from, text, signal) {
   const [host, to] = address(target);
@@ -770,6 +888,61 @@ async function deliver(config, target, from, text, signal) {
     return { ok: false, text: `${host}: ${reason(error)}` };
   }
 }
+
+/**
+ * The message tool: sends `params.text` from `from` and, when `params.wait`, waits for the answer, which `wait(to, signal)`
+ * takes as it comes. Resolves to what the tool says.
+ */
+export async function sendMessage(config, from, params, signal, wait = (to, signal) => nextFrom(from, to, signal)) {
+  const sent = await deliver(config, params.to, from, params.text, signal);
+  if (!sent.ok || !params.wait) return sent.text;
+  const answer = await wait(params.to, signal);
+  return answer === undefined ? `No answer from ${params.to} yet; it will arrive as a message.` : `${params.to} answered:\n${answer}`;
+}
+
+/**
+ * A handoff of `params.task` from `bot`: the chain it extends, why it is refused, if it is, and the prompt, which tells the
+ * bot who handed it over and, in `reach`, how to reach them.
+ */
+function handoffFrom(config, bot, params, reach) {
+  const chain = [...ABOVE, `${MACHINE}/${bot}`];
+  return { chain, refused: refusal(config, chain, params.bot, params.task),
+    prompt: `[Handed over by ${config.bots[bot].name} on ${MACHINE}, ${reach}]\n${params.task}` };
+}
+
+/** The handoff tool of a bot, which waits for the reply as it works; resolves to what the tool says. */
+export async function handOffAndWait(config, bot, params, signal, onProgress) {
+  const { chain, refused, prompt } = handoffFrom(config, bot, params, "who waits for your reply; put any question in it");
+  return refused || replyText(params.bot, await handOver(config, params.bot, { session: params.session, folder: params.folder }, prompt, chain, signal, onProgress));
+}
+
+// The team's tools, which pi gives bots in pi and botmode-claude.mjs gives bots in Claude Code.
+export const HANDOFF = {
+  name: "handoff",
+  description: "Hand a task to another bot on the team. Choose the bot whose description fits, and its session: 'continue' " +
+    "carries on in that bot's (or copy's) own session, which remembers its earlier work and is refused while busy; 'fresh' " +
+    "starts a new copy that remembers nothing; 'copy' starts a new copy that remembers everything the named session does. " +
+    "Copies run in parallel and are named bot.2, bot.3…; the reply names the session that answered. A new copy works in " +
+    "the folder of the session it comes from, or in the folder you name, such as another repository, and keeps it. When " +
+    "the bot needs a while, handoff returns at once and the reply reaches you later as a message.",
+  parameters: { type: "object", additionalProperties: false, required: ["bot", "session", "task"], properties: {
+    bot: { type: "string", description: "The bot or copy to hand the task to (research, research.2); host/id for one on another machine, and host/handler for its handler" },
+    session: { type: "string", enum: START, description: "continue: its own session; fresh: a new copy with no history; copy: a new copy of its session" },
+    folder: { type: "string", description: "Only with fresh or copy: the absolute path of the folder the new copy works in, on the bot's machine" },
+    task: { type: "string", description: "The complete task, with every requirement and the context the bot needs to work alone" },
+  } },
+};
+export const MESSAGE = {
+  name: "message",
+  description: "Send a message to a bot that is at work right now, or to handler, the handler that talks with the owner. It " +
+    "reaches them during their work. Use it to share findings, add to or correct a task in progress, or ask a question; " +
+    "set wait to get their answer back. Messages to you arrive the same way; answer them with message.",
+  parameters: { type: "object", additionalProperties: false, required: ["to", "text"], properties: {
+    to: { type: "string", description: "A session at work (research, research.2), handler, or host/session on another machine" },
+    text: { type: "string", description: "The message" },
+    wait: { type: "boolean", description: "Wait for their answer (up to 10 minutes) and get it as this tool's result" },
+  } },
+};
 
 /**
  * Who this pi is. In a bot's session under ~/.botmode/sessions it is that bot (research.2 is a copy of research); in any
@@ -850,7 +1023,7 @@ export default function botmode(pi) {
     const { session, box } = whoAmI(ctx);
     const file = ctx.sessionManager.getSessionFile();
     // A bot session you open is yours while it is open: no handoff runs in it.
-    if (ctx.hasUI && session && claim(session, "open in your window")) shared.entered.add(session);
+    if (ctx.hasUI && session && claim(session, OPEN)) shared.entered.add(session);
     // A session that another pi works in, a bot's or your handler's own carrying on without you: this window only shows
     // it, writes nothing to it and leaves its mail alone.
     const atWork = () => session ? holder(session) : [...shared.running].some((run) => run.file === file);
@@ -932,45 +1105,27 @@ export default function botmode(pi) {
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
     const me = whoAmI(ctx).bot;
-    const team = teamPrompt(config, me, await remoteTeams(config), working());
+    const team = teamPrompt(config, me, await remoteTeams(config), working(), [...sessionFiles().keys()]);
     // With only the team tools, pi's coding-assistant prompt would contradict the bot's own.
     return { systemPrompt: config.bots[me].tools?.length === 0 ? team : `${event.systemPrompt}\n\n${team}` };
   });
 
   pi.registerTool({
-    name: "handoff",
+    ...HANDOFF,
     label: "Handoff",
-    description: "Hand a task to another bot on the team. Choose the bot whose description fits, and its session: 'continue' " +
-      "carries on in that bot's (or copy's) own session, which remembers its earlier work and is refused while busy; 'fresh' " +
-      "starts a new copy that remembers nothing; 'copy' starts a new copy that remembers everything the named session does. " +
-      "Copies run in parallel and are named bot.2, bot.3…; the reply names the session that answered. A new copy works in " +
-      "the folder of the session it comes from, or in the folder you name, such as another repository, and keeps it. When " +
-      "the bot needs a while, handoff returns at once and the reply reaches you later as a message.",
     promptSnippet: "Hand a task to the team bot whose description fits",
-    parameters: { type: "object", additionalProperties: false, required: ["bot", "session", "task"], properties: {
-      bot: { type: "string", description: "The bot or copy to hand the task to (research, research.2); host/id for one on another machine, and host/handler for its handler" },
-      session: { type: "string", enum: START, description: "continue: its own session; fresh: a new copy with no history; copy: a new copy of its session" },
-      folder: { type: "string", description: "Only with fresh or copy: the absolute path of the folder the new copy works in, on the bot's machine" },
-      task: { type: "string", description: "The complete task, with every requirement and the context the bot needs to work alone" },
-    } },
     renderCall: (args, theme, context) => callView("handoff", args.bot, ` · ${args.session}${args.folder ? ` in ${args.folder}` : ""}`, args.task, theme, context),
     async execute(_id, params, signal, onUpdate, ctx) {
       const config = loadConfig();
       const me = whoAmI(ctx);
-      const chain = [...ABOVE, `${MACHINE}/${me.bot}`];
-      const refused = refusal(config, chain, params.bot, params.task);
-      if (refused) return result(refused);
-      // Where the bot reaches this session. A bot's own pi waits in handoff, and reads its messages only once the reply is in.
+      // A worker's pi ends with its turn, so it waits for the reply, and reads its messages only once the reply is in.
+      if (!ctx.hasUI) return result(await handOffAndWait(config, me.bot, params, signal, (steps) => onUpdate?.(result(steps))));
       const box = me.box ?? HANDLER;
-      const reach = !ctx.hasUI ? "who waits for your reply; put any question in it" : "who gets your reply when you finish; to ask or " +
-        `tell them something before then, message ${address(params.bot)[0] === undefined ? box : `${MACHINE}/${box}`}`;
-      const prompt = `[Handed over by ${config.bots[me.bot].name} on ${MACHINE}, ${reach}]\n${params.task}`;
-      const how = { session: params.session, folder: params.folder };
-      if (!ctx.hasUI) { // A worker's pi ends with its turn, so it waits for the reply.
-        const outcome = await handOver(config, params.bot, how, prompt, chain, signal, (steps) => onUpdate?.(result(steps)));
-        return result(replyText(params.bot, outcome));
-      }
+      const { chain, refused, prompt } = handoffFrom(config, me.bot, params, "who gets your reply when you finish; to ask or " +
+        `tell them something before then, message ${address(params.bot)[0] === undefined ? box : `${MACHINE}/${box}`}`);
+      if (refused) return result(refused);
       // In a window the bot works in the background, and its reply comes back through this session's mailbox.
+      const how = { session: params.session, folder: params.folder };
       const done = handOver(config, params.bot, how, prompt, chain, undefined, () => {});
       const early = await Promise.race([done, new Promise((resolve) => setTimeout(resolve, 1000))]); // A refusal comes back at once.
       if (early) return result(replyText(params.bot, early));
@@ -980,32 +1135,22 @@ export default function botmode(pi) {
   });
 
   pi.registerTool({
-    name: "message",
+    ...MESSAGE,
     label: "Message",
-    description: "Send a message to a bot that is at work right now, or to handler, the handler that talks with the owner. It " +
-      "reaches them during their work. Use it to share findings, add to or correct a task in progress, or ask a question; " +
-      "set wait to get their answer back. Messages to you arrive the same way; answer them with message.",
     promptSnippet: "Message a bot at work, or the handler",
-    parameters: { type: "object", additionalProperties: false, required: ["to", "text"], properties: {
-      to: { type: "string", description: "A session at work (research, research.2), handler, or host/session on another machine" },
-      text: { type: "string", description: "The message" },
-      wait: { type: "boolean", description: "Wait for their answer (up to 10 minutes) and get it as this tool's result" },
-    } },
     renderCall: (args, theme, context) => callView("message", args.to, args.wait ? " · waits for the answer" : "", args.text, theme, context),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const sent = await deliver(loadConfig(), params.to, whoAmI(ctx).box ?? HANDLER, params.text, signal);
-      if (!sent.ok || !params.wait) return result(sent.text);
-      const answer = await new Promise((resolve) => {
+      // readMail takes this session's messages as they come, and hands the awaited answer to the wait.
+      return result(await sendMessage(loadConfig(), whoAmI(ctx).box ?? HANDLER, params, signal, (to, signal) => new Promise((resolve) => {
         const done = (text) => {
           clearTimeout(timeout);
-          waiting.delete(params.to);
+          waiting.delete(to);
           resolve(text);
         };
         const timeout = setTimeout(done, WAIT);
-        waiting.set(params.to, done);
+        waiting.set(to, done);
         signal?.addEventListener("abort", () => done(), { once: true });
-      });
-      return result(answer === undefined ? `No answer from ${params.to} yet; it will arrive as a message.` : `${params.to} answered:\n${answer}`);
+      })));
     },
   });
 
@@ -1014,9 +1159,9 @@ export default function botmode(pi) {
     name: "configure",
     label: "Configure",
     description: "Change the team's configuration with a JSON merge patch: objects merge, null deletes a key, other values " +
-      "replace. Creates, edits and removes bots and sets defaults. The whole patch applies, or nothing does and the result " +
-      "lists every problem.",
-    promptSnippet: "Create, edit or remove team bots with a JSON merge patch",
+      "replace. Creates, edits, archives and removes bots and sets defaults. The whole patch applies, or nothing does and the " +
+      "result lists every problem.",
+    promptSnippet: "Create, edit, archive or remove team bots with a JSON merge patch",
     parameters: { type: "object", additionalProperties: false, required: ["patch"], properties: {
       patch: { type: "object", description: 'For example {"bots": {"research": {"name": "Researcher", "description": "Finds and summarizes sources"}}}' },
     } },
@@ -1045,13 +1190,27 @@ export default function botmode(pi) {
    * work to watch, which the window takes over once the bot is done. The session you leave carries on if it is at work.
    */
   async function focus(ctx, session) {
+    const config = loadConfig();
     const file = sessionFiles().get(session);
+    if (config.bots[botOf(session)]?.agent === "claude") return talkInClaude(ctx, config, session, file);
     if (!file) return watch(ctx, session, holder(session)?.task); // A new copy has no session to show before its first step.
     try {
-      await enter(ctx, session, file, folderOf(loadConfig(), session, file));
+      await enter(ctx, session, file, folderOf(config, session, file));
     } catch (error) { // pi refuses a session whose folder is gone.
       ctx.ui.notify(`${session}: ${reason(error)}`, "error");
     }
+  }
+
+  /**
+   * A bot in Claude Code: one at work you watch, and with any other you talk in Claude Code, in a room of its own, which the
+   * rooms keep as yours while it is open. Leaving it, with /exit, brings you back to your handler.
+   */
+  async function talkInClaude(ctx, config, session, file) {
+    const task = holder(session)?.task;
+    if (!file || (task && task !== OPEN)) return watch(ctx, session, task);
+    if (!rooms) return ctx.ui.notify(`${session} works in Claude Code, which opens in a room of the \`botmode\` command's window. Hand it work instead.`, "warning");
+    const args = [...(await claudeArgs(config, session, [])), "--resume", header(file).claude];
+    return toRooms({ busy: busy(ctx, whoAmI(ctx).box), open: session, claude: true, args, cwd: folderOf(config, session, file) });
   }
 
   /** A session at work: shows what it is doing, and lets you message it, or stop it if this pi runs it. */
@@ -1080,10 +1239,11 @@ export default function botmode(pi) {
       const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}${homeAtWork ? " · working" : ""}`,
         () => here ? enter(ctx, HANDLER, shared.home) : watching && watch(ctx, HANDLER)]]);
       for (const session of new Set([...files.keys(), ...busy.keys()])) {
-        // handler here is another machine's handler talking with this one, not a bot of yours; skip removed bots too.
-        if (session === HANDLER || !Object.hasOwn(config.bots, botOf(session))) continue;
+        // handler here is another machine's handler talking with this one, not a bot of yours; skip removed and archived bots too.
+        if (!inLobby(config, session)) continue;
         const state = session === here ? "you are here" : busy.has(session) ? `working · ${busy.get(session)}` : `idle · ${ago(files.get(session))}`;
-        choices.set(`${session} · ${state} · ${folderOf(config, session, files.get(session))}`, () => session !== here ? focus(ctx, session)
+        const agent = config.bots[botOf(session)].agent === "claude" ? " · Claude Code" : "";
+        choices.set(`${session} · ${state} · ${folderOf(config, session, files.get(session))}${agent}`, () => session !== here ? focus(ctx, session)
           : watching && watch(ctx, session, busy.get(session)));
       }
       const remote = new Set();

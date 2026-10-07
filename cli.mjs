@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The `botmode` command. With no command it opens your handler in pi's TUI, and other arguments go to pi. `setup`,
 // `invite`, `status` and `teardown` set up, connect, check and undo this machine; `host` is what runs in the background.
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -10,8 +10,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { HANDLER, HOME, PORT, applyPatch, callHost, hasToken, inviteCode, loadConfig, readInvite, remoteTeams, saveToken, serve, setHost, token, working }
-  from "./botmode.mjs";
+import { HANDLER, HOME, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, loadConfig, readInvite, release, remoteTeams, saveToken,
+  serve, setHost, token, working } from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
 const EXTENSION = fileURLToPath(new URL("botmode.mjs", import.meta.url));
@@ -19,6 +19,11 @@ const DRAWING = fileURLToPath(new URL("botmode-tui.mjs", import.meta.url)); // L
 // pi comes with this package. Its command is dist/bundle/cli.js, beside the dist/index.js the package exports.
 const PI = path.join(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
 process.env.BOTMODE_PI = PI;
+// So does Claude Code, for coding bots: its install puts the program for this machine in place of bin/claude.exe.
+const CLAUDE_PACKAGE = createRequire(import.meta.url).resolve("@anthropic-ai/claude-code/package.json");
+const CLAUDE = path.join(path.dirname(CLAUDE_PACKAGE), "bin", "claude.exe");
+process.env.BOTMODE_CLAUDE = CLAUDE;
+process.env.DISABLE_AUTOUPDATER = "1"; // It updates with Botmode.
 const LOCAL = `http://127.0.0.1:${PORT}`;
 const TAILNET_PORT = 8445; // The HTTPS port `tailscale serve` shares this machine's host on.
 const HOST_COMMAND = [process.execPath, CLI, "host"];
@@ -31,7 +36,7 @@ const SUDOERS = "/etc/sudoers.d/botmode"; // On macOS, lets your bots use sudo w
 const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"]; // pi's thinking levels.
 const THINKING = new RegExp(`:(${LEVELS.join("|")})$`);
 const HELP = `botmode                  talk to your handler in pi's TUI; other arguments go to pi
-botmode setup            sign in to a model, pick your bots' model, and let your other machines connect
+botmode setup            sign in to a model and Claude Code, pick your bots' model, and let your other machines connect
 botmode setup <invite>   connect this machine to the one that printed the invite
 botmode invite           print an invite for another machine
 botmode status           show this machine's sign-ins, model, bots, host and connected machines
@@ -320,11 +325,34 @@ async function stopHost() {
   if (process.platform === "win32") quietly("schtasks", ["/end", "/tn", TASK]); // So the next /run is not taken for a second copy.
 }
 
-/** Runs sudo in your terminal, where it asks for your password. */
-function sudo(...args) {
-  terminal?.close(); // Hands the terminal to sudo; the next question opens it again.
+/** Runs `command` in your terminal, where it can ask you things itself. */
+function inTerminal(command, args) {
+  terminal?.close(); // Hands the terminal over; the next question opens it again.
   terminal = undefined;
-  execFileSync("sudo", args, { stdio: "inherit" });
+  execFileSync(command, args, { stdio: "inherit" });
+}
+
+/** Runs sudo in your terminal, where it asks for your password. */
+const sudo = (...args) => inTerminal("sudo", args);
+
+/** Claude Code's sign-in, as it reports it: {loggedIn, authMethod, …}, or {} when it cannot say. */
+function claudeSignIn() {
+  try {
+    return JSON.parse(spawnSync(CLAUDE, ["auth", "status", "--json"], { encoding: "utf-8" }).stdout) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** Shows whether Claude Code is signed in, and signs it in if you say so. */
+async function claudeStep() {
+  const before = claudeSignIn();
+  say(before.loggedIn ? `Claude Code is signed in (${before.authMethod}).` : "Claude Code is not signed in yet. Your coding bots need it.");
+  if (!(await yes(before.loggedIn ? "Sign in with another account?" : "Sign in now?", !before.loggedIn))) return;
+  try {
+    inTerminal(CLAUDE, ["auth", "login"]);
+  } catch {} // Cancelled, or it said why.
+  say(claudeSignIn().loggedIn ? "Claude Code is signed in." : "Claude Code is not signed in. Run `botmode setup` to try again.");
 }
 
 /** macOS: lets your bots use sudo without a password, or takes that away. */
@@ -410,7 +438,9 @@ async function setup(code) {
   }
   say("\n2. Your bots' model");
   await chooseModel(pi.runtime);
-  say("\n3. Your other machines");
+  say('\n3. Claude Code, which coding bots ("agent": "claude") work in');
+  await claudeStep();
+  say("\n4. Your other machines");
   if (invite) await join(invite, net);
   else if (await hostAnswers()) {
     if (!net.problem) await share(net); // A restart, so an updated Botmode takes effect.
@@ -423,7 +453,7 @@ async function setup(code) {
     }
   }
   if (process.platform === "darwin") {
-    say("\n4. Admin rights");
+    say("\n5. Admin rights");
     await sudoStep();
   }
   say("\nDone. Run `botmode` to talk to your handler, or `botmode status` to check this machine.");
@@ -443,6 +473,9 @@ async function status() {
   const teams = await remoteTeams(config);
   say(`Engine    pi ${pi.version}, signed in to ${providersOf(await usableModels(pi.runtime)).join(", ") || "nothing yet (run botmode setup)"}`);
   say(`Model     ${config.defaults?.model || "pi's default"}`);
+  const claude = claudeSignIn();
+  say(`Claude    Claude Code ${JSON.parse(fs.readFileSync(CLAUDE_PACKAGE, "utf-8")).version}, ` +
+    `${claude.loggedIn ? `signed in (${claude.authMethod})` : "not signed in (run botmode setup)"}`);
   say(`Bots      ${Object.keys(config.bots).join(", ")}  (${path.join(HOME, "config.json")})`);
   say(`Host      ${(await hostAnswers()) ? `running on ${LOCAL}` : "not running"}${startsAtLogin() ? ", starts at login" : ""}`);
   say(`Tailnet   ${net.problem ?? (sharedOnTailnet(net) === LOCAL ? `shared at ${net.url}` : "not shared")}`);
@@ -477,7 +510,8 @@ async function teardown() {
     say(`Deleted ${HOME}.`);
   }
   const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
-  say(`Your model sign-ins stay in ${getAgentDir()}, where pi keeps them. To remove the command too: npm uninstall -g botmode`);
+  say(`Your model sign-ins stay in ${getAgentDir()}, where pi keeps them, and Claude Code keeps its own. To remove the command ` +
+    "too: npm uninstall -g botmode");
 }
 
 async function restart() {
@@ -526,10 +560,10 @@ async function openWindow(args) {
     res.end();
     if (req.url !== `/${secret}`) return;
     try {
-      const { room, busy, open, args, cwd } = JSON.parse(body);
+      const { room, busy, open, args, cwd, claude } = JSON.parse(body);
       if (rooms.has(room)) rooms.get(room).busy = busy === true;
       if (typeof open === "string") {
-        if (!rooms.has(open) && Array.isArray(args)) start(open, args, cwd);
+        if (!rooms.has(open) && Array.isArray(args)) start(open, args, cwd, claude === true);
         show(open);
       } else if (!busy && room !== shown && room !== HANDLER) close(room); // Its work is done, out of sight.
     } catch {} // A request this process cannot carry out changes nothing.
@@ -555,15 +589,24 @@ async function openWindow(args) {
     if (left) process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
     fit();
   }
-  function start(name, piArgs, cwd) {
-    const term = pty.spawn(process.execPath, [PI, "-e", EXTENSION, "-e", DRAWING, ...piArgs], {
-      name: process.env.TERM || "xterm-256color", cols: process.stdout.columns, rows: process.stdout.rows, cwd,
-      env: { ...process.env, BOTMODE_ROOMS: url, BOTMODE_ROOM: name },
-    });
+  /** A room running pi with `args`, or, for a bot in Claude Code, Claude Code, which is yours while its room is open. */
+  function start(name, args, cwd, claude) {
+    if (claude && !claim(name, OPEN)) return; // A handoff has just taken it.
+    let term;
+    try {
+      term = pty.spawn(claude ? CLAUDE : process.execPath, claude ? args : [PI, "-e", EXTENSION, "-e", DRAWING, ...args], {
+        name: process.env.TERM || "xterm-256color", cols: process.stdout.columns, rows: process.stdout.rows, cwd,
+        env: { ...process.env, BOTMODE_ROOMS: url, BOTMODE_ROOM: name },
+      });
+    } catch (error) {
+      if (claude) release(name);
+      throw error;
+    }
     started++;
     rooms.set(name, { term, busy: false });
     term.onData((data) => name === shown && process.stdout.write(data));
     term.onExit(({ exitCode }) => {
+      if (claude) release(name);
       if (rooms.get(name)?.term !== term) return; // Closed by this process.
       rooms.delete(name);
       if (name === shown) seen++;

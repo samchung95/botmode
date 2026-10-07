@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 
 process.env.BOTMODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "botmode-"));
 process.env.BOTMODE_MACHINE = "pc";
-process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs.
+process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs,
+process.env.BOTMODE_CLAUDE = fileURLToPath(new URL("fake-claude.mjs", import.meta.url)); // and Claude Code bots as fake-claude.mjs.
 const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, loadConfig, mergePatch, problems, readInvite,
   refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
 
@@ -51,6 +52,7 @@ async function open(session, { window = !session } = {}) {
   await events.session_start({ type: "session_start" }, ctx);
   const call = async (name, params) => (await tools[name].execute("call", params, undefined, undefined, ctx)).content[0].text;
   return { ctx, call, commands, sent, status, switched, notes, dispatched, screen,
+    prompt: async () => (await events.before_agent_start({ type: "before_agent_start", systemPrompt: "pi's prompt" }, ctx)).systemPrompt,
     press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
     close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx),
     // pi switching this window to another session: it asks first, stops what this one does, then closes it.
@@ -93,6 +95,12 @@ test("a bad patch changes nothing and lists every problem", () => {
     [{ bots: { a: { name: "A", description: "a", workspace: "relative" } } }, /existing absolute folder/],
     [{ bots: { a: { name: "A" } }, extra: 1 }, /extra is not a configuration section[\s\S]*bots.a.description is required/],
     [JSON.parse('{"bots": {"__proto__": {"name": "x", "description": "y"}}}'), /__proto__: an id is/],
+    [{ bots: { a: { name: "A", description: "a", agent: "codex" } } }, /bots.a.agent must be "pi" or "claude"/],
+    [{ bots: { handler: { agent: "claude" } } }, /bots.handler.agent: the handler works in pi/],
+    [{ bots: { a: { name: "A", description: "a", agent: "claude", tools: ["read"] } } }, /bots.a.tools: a bot in Claude Code has Claude Code's tools/],
+    [{ bots: { research: { archived: ["a", "research.x"] } } }, /bots.research.archived must list research or its copies, such as research.2/],
+    [{ bots: { research: { archived: "research" } } }, /bots.research.archived must be a list/],
+    [{ bots: { handler: { archived: ["handler"] } } }, /bots.handler.archived: the handler cannot be archived/],
     ["not an object", /must be a JSON object/],
   ]) assert.match(applyPatch(patch).join("\n"), problem);
   assert.equal(fs.readFileSync(path.join(HOME, "config.json"), "utf-8"), before);
@@ -467,5 +475,124 @@ test("an invite carries the token, and machines join and leave each other", asyn
     assert.deepEqual(loadConfig().hosts, {});
   } finally {
     server.close();
+  }
+});
+
+test("a bot with agent claude works in Claude Code, with no permission prompts, in its own session and in copies", async () => {
+  assert.deepEqual(applyPatch({ bots: { coder: { name: "Coder", description: "Writes code", agent: "claude", model: "opus" } } }), []);
+  const handler = await open();
+  try {
+    assert.equal(await handler.call("handoff", { bot: "coder", session: "continue", task: "how do you run" }), "coder replied:\ncoder heard: " +
+      "[Handed over by Handler on pc, who gets your reply when you finish; to ask or tell them something before then, message handler]\n" +
+      'how do you run · opus, bypassPermissions, ← edits, as "You are Coder. Writes code"');
+    assert.match(await handler.call("handoff", { bot: "coder", session: "continue", task: "second" }), /^coder replied:\ncoder heard: .*how do you run \| .*second$/s);
+    assert.match(await handler.call("handoff", { bot: "coder", session: "fresh", task: "third" }), /^coder\.2 replied:\ncoder\.2 heard: [^|]*third$/);
+    assert.match(await handler.call("handoff", { bot: "coder", session: "copy", task: "fourth" }),
+      /^coder\.3 replied:\ncoder\.3 heard: .*how do you run \| .*second \| .*fourth$/s); // A copy remembers coder's conversation.
+  } finally {
+    handler.close();
+  }
+});
+
+test("a bot in Claude Code hears messages after each step, and hands work to the team and messages it with the team's tools", async () => {
+  const handler = await open();
+  const a = await open("a"); // a's own pi, at work.
+  try {
+    assert.match(await handler.call("handoff", { bot: "coder", session: "continue", task: "slow: refactor" }), /working on it in the background/);
+    await until(() => working().some((session) => session.id === "coder"));
+    assert.equal(await handler.call("message", { to: "coder", text: "use tabs" }), "Sent to coder.");
+    await until(() => handler.sent.length);
+    assert.match(handler.sent[0].content, /^coder replied:\ncoder heard: .*slow: refactor \| \[Message from handler; answer with message to handler\]\nuse tabs$/s);
+    // It waits for the replies of its handoffs, as a bot in pi does.
+    assert.match(await a.call("handoff", { bot: "coder", session: "fresh", task: 'use handoff {"bot":"b","session":"fresh","task":"find docs"}' }),
+      /^coder\.4 replied:\ncoder\.4 heard: .* · b\.\d+ replied:\nb\.\d+ heard: \[Handed over by Coder on pc, who waits for your reply; put any question in it\]\nfind docs$/s);
+    assert.match(await a.call("handoff", { bot: "coder", session: "fresh", task: 'use message {"to":"handler","text":"done soon"}' }), / · Sent to handler\.$/);
+    await until(() => handler.sent.length > 1);
+    assert.equal(handler.sent[1].content, "[Message from coder.5; answer with message to coder.5]\ndone soon");
+  } finally {
+    handler.close();
+    a.close();
+  }
+});
+
+test("the lobby opens a bot in Claude Code in a room of its own, where ← edits, and one at work to watch", async () => {
+  const asked = [];
+  const rooms = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    asked.push(JSON.parse(body));
+    res.end();
+  });
+  await once(rooms.listen(0, "127.0.0.1"), "listening");
+  process.env.BOTMODE_ROOMS = `http://127.0.0.1:${rooms.address().port}/secret`;
+  process.env.BOTMODE_ROOM = "handler";
+  const handler = await open();
+  let pick = "coder ", shown, menu;
+  handler.ctx.ui.select = async (title, options) => title === "Sessions" ? (shown = options).find((option) => option.startsWith(pick)) : (menu = options, undefined);
+  try {
+    await handler.commands.sessions.handler("", handler.ctx);
+    assert.ok(shown.includes(`coder · idle · just now · ${path.join(HOME, "bots", "coder")} · Claude Code`), shown.join("\n"));
+    const [{ open: room, claude, args, cwd }] = asked.filter((message) => message.open);
+    assert.deepEqual([room, claude, cwd], ["coder", true, path.join(HOME, "bots", "coder")]);
+    assert.equal(JSON.parse(args[args.indexOf("--settings") + 1]).leftArrowOpensAgents, false);
+    assert.equal(args.at(-2), "--resume");
+    assert.match(fs.readFileSync(path.join(HOME, "claude", `${args.at(-1)}.jsonl`), "utf-8"), /how do you run/); // coder's own conversation.
+    // A bot at work you watch, in Claude Code too.
+    assert.match(await handler.call("handoff", { bot: "coder", session: "fresh", task: "slow: tests" }), /working on it in the background/);
+    pick = "coder.6 · working";
+    await handler.commands.sessions.handler("", handler.ctx);
+    assert.deepEqual(menu, ["Send coder.6 a message", "Stop coder.6"]);
+    await until(() => handler.sent.length);
+  } finally {
+    delete process.env.BOTMODE_ROOMS;
+    delete process.env.BOTMODE_ROOM;
+    rooms.close();
+    handler.close();
+  }
+  const plain = await open(); // pi started without the botmode command's rooms.
+  plain.ctx.ui.select = async (_title, options) => options.find((option) => option.startsWith("coder "));
+  try {
+    await plain.commands.sessions.handler("", plain.ctx);
+    assert.deepEqual(plain.notes, ["coder works in Claude Code, which opens in a room of the `botmode` command's window. Hand it work instead."]);
+  } finally {
+    plain.close();
+  }
+});
+
+test("the handler archives a copy, or a whole bot, which leaves the lobby and the team until it brings it back as it was", async () => {
+  const handler = await open();
+  let shown;
+  handler.ctx.ui.select = async (_title, options) => { shown = options; };
+  const lobby = async () => {
+    await handler.commands.sessions.handler("", handler.ctx);
+    return shown.map((option) => option.split(" · ")[0]);
+  };
+  const sessionsLine = async () => (await handler.prompt()).match(/^Bot sessions on this machine: (.*)$/m)?.[1].split(", ") ?? [];
+  const gone = /^(research\.2|coder(\.\d+)?)$/;
+  const server = serve(0);
+  await once(server, "listening");
+  const roster = async () => (await remoteTeams({ hosts: { self: { url: `http://127.0.0.1:${server.address().port}` } } })).self.bots.map((bot) => bot.id);
+  try {
+    // The handler sees the bots' sessions here, so it can archive the ones the owner is done with.
+    const before = await sessionsLine();
+    assert.ok(["research", "research.2", "research.3", "coder", "coder.2"].every((session) => before.includes(session)), before.join());
+    assert.match(await handler.call("configure", { patch: { bots: { research: { archived: ["research.2"] }, coder: { archived: ["coder"] } } } }), /^Applied/);
+    const listed = await lobby();
+    assert.ok(listed.includes("research") && listed.includes("research.3") && !listed.some((session) => gone.test(session)), listed.join());
+    assert.ok(!(await sessionsLine()).some((session) => gone.test(session)));
+    assert.doesNotMatch(await handler.prompt(), /^- coder \(/m); // Off the team,
+    assert.ok(!(await roster()).includes("coder")); // here and on your other machines.
+    assert.match(await handler.call("handoff", { bot: "coder", session: "fresh", task: "go" }), /Refused: coder is archived/);
+    assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "go" }), /Refused: research\.2 is archived/);
+    assert.match(await handler.call("handoff", { bot: "research.3", session: "continue", task: "still here" }), /^research\.3 replied/);
+    // Brought back, each is as it was, history and all.
+    assert.match(await handler.call("configure", { patch: { bots: { research: { archived: null }, coder: { archived: null } } } }), /^Applied/);
+    const back = await lobby();
+    assert.ok(["research.2", "coder", "coder.2"].every((session) => back.includes(session)), back.join());
+    assert.ok((await roster()).includes("coder"));
+    assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "back again" }), /^research\.2 replied:\nresearch\.2 heard: .*second.*back again$/s);
+  } finally {
+    server.close();
+    handler.close();
   }
 });
