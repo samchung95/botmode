@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 process.env.BOTMODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "botmode-"));
 process.env.BOTMODE_MACHINE = "pc";
 process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs.
-const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, handOver, inviteCode, loadConfig, mergePatch, problems, readInvite,
+const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, loadConfig, mergePatch, problems, readInvite,
   refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
 
 /**
@@ -25,6 +25,7 @@ async function open(session, { window = !session } = {}) {
     registerTool: (tool) => { tools[tool.name] = tool; },
     registerCommand: (name, command) => { commands[name] = command; },
     sendMessage: (message, options) => sent.push({ ...message, ...options }),
+    registerMessageRenderer: () => {},
     sendUserMessage: (text) => dispatched.push(text),
     setActiveTools: (names) => { status.tools = names; },
     setModel: async () => true,
@@ -50,7 +51,12 @@ async function open(session, { window = !session } = {}) {
   const call = async (name, params) => (await tools[name].execute("call", params, undefined, undefined, ctx)).content[0].text;
   return { ctx, call, commands, sent, status, switched, notes, dispatched, screen,
     press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
-    close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx) };
+    close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx),
+    // pi switching this window to another session: it asks first, stops what this one does, then closes it.
+    leave: async (targetSessionFile) => {
+      await events.session_before_switch({ type: "session_before_switch", reason: "resume", targetSessionFile }, ctx);
+      events.session_shutdown({ type: "session_shutdown", reason: "resume", targetSessionFile }, ctx);
+    } };
 }
 
 /** The newest file of a bot session, which is the one pi opens. */
@@ -166,10 +172,6 @@ test("/sessions enters a bot's session as that bot, and the overview goes back t
     return options.find((option) => option.startsWith("research.2 "));
   };
   try {
-    handler.ctx.isIdle = () => false; // Leaving stops your handler's reply, so you are asked first; this says no.
-    await handler.commands.sessions.handler("", handler.ctx);
-    assert.deepEqual(handler.switched, []);
-    handler.ctx.isIdle = () => true;
     await handler.commands.sessions.handler("", handler.ctx);
     assert.equal(shown[0], "handler · you are here");
     assert.match(shown.join("\n"), /^research\.2 · idle · /m);
@@ -250,6 +252,54 @@ test("/sessions opens a bot at work to watch, what you type goes to it, and once
   }
 });
 
+test("leaving a session at work leaves it working: it carries on without you, and you can come back and watch it", async () => {
+  const home = path.join(HOME, "owner", "owner.jsonl");
+  fs.mkdirSync(path.dirname(home), { recursive: true });
+  fs.writeFileSync(home, `${JSON.stringify({ type: "session", cwd: process.cwd() })}\n`);
+  const lastReply = (file) => fs.readFileSync(file, "utf-8").trim().split("\n").map((line) => JSON.parse(line)).at(-1).message?.content[0].text;
+  const handler = await open();
+  let copy, back;
+  try {
+    handler.ctx.isIdle = () => false; // Your handler is mid-reply as you open research.2, and nothing asks first.
+    handler.ctx.ui.select = async (_title, options) => options.find((option) => option.startsWith("research.2 "));
+    await handler.commands.sessions.handler("", handler.ctx);
+    process.env.FAKE_PI_SLOW = "1";
+    await handler.leave(handler.switched[0]); // pi stops the reply as it switches; your handler carries on without you,
+    delete process.env.FAKE_PI_SLOW;
+    copy = await open("research.2", { window: true });
+    let shown;
+    copy.ctx.ui.select = async (_title, options) => (shown = options, options[0]);
+    copy.ctx.isIdle = () => false; // and so does research.2 when you go back mid-reply.
+    await copy.commands.sessions.handler("", copy.ctx);
+    assert.equal(shown[0], "handler · back to your conversation · working");
+    await copy.leave(home);
+    assert.match(working().find((session) => session.id === "research.2")?.task ?? "", /^Carry on where you stopped/);
+    // Your handler's conversation is still at work: you watch it, and what you type reaches it.
+    back = await open();
+    assert.match(back.status.botmode, /^handler is at work/);
+    assert.deepEqual(await back.type("and the mac"), { action: "handled" });
+    assert.deepEqual(back.notes, ["Sent to your handler."]);
+    // Your message waited for its turn to end and was its next, the window opening the conversation again as it went.
+    await until(() => / \| and the mac$/.test(lastReply(home)), 15000);
+    assert.match(lastReply(home), /^owner heard: Carry on where you stopped/);
+    assert.ok(back.dispatched.includes("/sessions handler"));
+    assert.match(lastReply(fileOf("research.2")), /^research\.2 heard: .*\| Carry on where you stopped/s);
+  } finally {
+    handler.close();
+    copy?.close();
+    back?.close();
+  }
+});
+
+test("bots take colours in turn, copies share their bot's, and the colours go round again", () => {
+  assert.equal(colourOf("research.2"), colourOf("research"));
+  assert.notEqual(colourOf("handler"), colourOf("research"));
+  const far = Array.from({ length: 9 }, (_, n) => colourOf(`far/bot${n}`));
+  assert.equal(new Set(far.slice(0, 8)).size, 8);
+  assert.equal(far[8], far[0]);
+  assert.equal(colourOf("far/bot0.3"), far[0]);
+});
+
 test("handoffs refuse the handler, cycles, long chains and empty tasks", () => {
   applyPatch({ bots: Object.fromEntries(["a", "b", "c"].map((id) => [id, { name: id, description: id }])) });
   const config = loadConfig();
@@ -308,6 +358,17 @@ test("only the owner sets hosts, and a host's bots join the team over HTTP", asy
       assert.match((await job).text, /\[Message from pc\/handler; answer with message to pc\/handler\]\ncome back$/);
     } finally {
       handler.close();
+    }
+    // A handoff to a machine's handler while its window is open goes into that conversation, as a message from the sender.
+    const window = await open();
+    try {
+      const outcome = await handOver(loadConfig(), "self/handler", { session: "continue" }, "set up the bots", ["mac/handler"], undefined, () => {});
+      assert.match(outcome.text, /in pc's window/);
+      await until(() => window.sent.length);
+      assert.equal(window.sent[0].content, "[Message from mac/handler; answer with message to mac/handler]\nset up the bots");
+      assert.deepEqual(window.sent[0].details, { from: "mac/handler" }); // Drawn in mac/handler's colour.
+    } finally {
+      window.close();
       setHost("self", null);
     }
     fs.writeFileSync(path.join(HOME, "token"), "b".repeat(64));

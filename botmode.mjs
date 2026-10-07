@@ -21,6 +21,7 @@ const CONFIG = path.join(HOME, "config.json");
 const TOKEN = path.join(HOME, "token"); // The secret all your machines share; a host runs bots only for requests that carry it.
 const SESSIONS = path.join(HOME, "sessions");
 const MAIL = path.join(HOME, "mail"); // One folder per session that reads messages; each message is a JSON file.
+const WINDOW = path.join(HOME, "window"); // The pid of the pi whose window has your handler's conversation open.
 const ABOVE = (process.env.BOTMODE_CHAIN || "").split(",").filter(Boolean); // machine/bot entries waiting on this bot, outermost first.
 const SELF = fileURLToPath(import.meta.url);
 // pi's entry script. Inside pi it is process.argv[1]; the `botmode` command sets BOTMODE_PI after importing this file.
@@ -73,6 +74,54 @@ if (!shared.exitHook) {
   process.once("exit", () => shared.running.forEach((run) => run.stop())); // Bots never outlive the pi that started them.
 }
 
+// The colours bots take in turn, as 256-colour codes that read on dark and light backgrounds.
+const COLOURS = [75, 214, 141, 78, 205, 220, 80, 167];
+
+/** A bot's colour, which its copies share: your team in config.json's order, then the rest as they first show up. */
+export function colourOf(name) {
+  if (!shared.colours) {
+    const config = loadConfig();
+    shared.colours = new Map([...Object.keys(config.bots), ...Object.keys(config.hosts ?? {}).map((host) => `${host}/${HANDLER}`)]
+      .map((id, n) => [id, COLOURS[n % COLOURS.length]]));
+  }
+  const bot = name.replace(/\.\d+$/, "");
+  if (!shared.colours.has(bot)) shared.colours.set(bot, COLOURS[shared.colours.size % COLOURS.length]);
+  return shared.colours.get(bot);
+}
+
+// pi lends an extension its TUI through a static import only, which this file cannot make: its tests and the botmode
+// command load it without pi. botmode-tui.mjs, loaded beside it in your window, hands it over.
+const tui = () => globalThis[Symbol.for("botmode.tui")];
+
+/** Draws `inner` with a bar in `name`'s colour down its left side. */
+const marked = (name, inner) => ({
+  render: (width) => inner.render(width - 1).map((line) => `\x1b[38;5;${colourOf(name)}m▌\x1b[39m${line}`),
+  invalidate: () => inner.invalidate(),
+});
+const painted = (name, text) => `\x1b[1;38;5;${colourOf(name)}m${text}\x1b[22;39m`;
+
+/** A message from a bot as pi draws an extension's message, labelled and marked in the sender's colour. */
+function messageView(message, theme) {
+  const from = message.details?.from;
+  if (!from || !tui()) return undefined; // pi's own look.
+  const { Box, Markdown, Spacer, Text, getMarkdownTheme } = tui();
+  const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+  box.addChild(new Text(painted(from, `[${from}]`), 0, 0));
+  box.addChild(new Spacer(1));
+  box.addChild(new Markdown(textOf(message.content), 0, 0, getMarkdownTheme(), { color: (text) => theme.fg("customMessageText", text) }));
+  return marked(from, box);
+}
+
+/** A handoff or message call as pi draws a tool call, with who it goes to in their colour. */
+function callView(tool, to, more, text, theme, { argsComplete, expanded }) {
+  // Throwing gives pi's own look: without the TUI, and while the model still writes the name, which would take a colour.
+  if (!tui() || !argsComplete || typeof to !== "string") throw new Error("pi draws it");
+  const body = typeof text === "string" ? expanded ? text : oneLine(text, 160) : "";
+  const { Text } = tui();
+  return marked(to, new Text(`${theme.fg("toolTitle", theme.bold(tool))} ${painted(to, `→ ${to}`)}${theme.fg("muted", more)}\n` +
+    theme.fg("toolOutput", body), 0, 0));
+}
+
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const isFolder = (folder) => fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory() ?? false;
 const isWebUrl = (url) => typeof url === "string" && URL.canParse(url) && /^https?:$/.test(new URL(url).protocol);
@@ -121,6 +170,16 @@ function claim(session, task) {
 
 const release = (session) => fs.rmSync(lockOf(session), { force: true });
 
+/** Whether your handler's conversation is open in a window on this machine, where its messages reach it. */
+function windowOpen() {
+  try {
+    process.kill(Number(fs.readFileSync(WINDOW, "utf-8")), 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
 /** Each bot session on this machine and its newest file, newest first. */
 function sessionFiles() {
   const names = fs.existsSync(SESSIONS) ? fs.readdirSync(SESSIONS).filter((name) => name.endsWith(".jsonl")).sort().reverse() : [];
@@ -163,14 +222,18 @@ function claimCopy(bot, task) {
 function folderOf(config, session, file = sessionFiles().get(session)) {
   const bot = botOf(session);
   const own = config.bots[bot]?.workspace || path.join(HOME, "bots", bot);
-  if (session === bot || !file) return own;
+  return session === bot || !file ? own : startedIn(file) ?? own;
+}
+
+/** The folder a session started in, which pi keeps in the first line of its file. */
+function startedIn(file) {
   const head = Buffer.alloc(64 * 1024);
   const fd = fs.openSync(file, "r");
   try {
     const { cwd } = JSON.parse(head.toString("utf-8", 0, fs.readSync(fd, head)).split("\n", 1)[0]);
-    return typeof cwd === "string" && cwd ? cwd : own;
+    return typeof cwd === "string" && cwd ? cwd : undefined;
   } catch {
-    return own;
+    return undefined;
   } finally {
     fs.closeSync(fd);
   }
@@ -348,22 +411,30 @@ function runBot(config, target, how, prompt, chain, signal, onProgress) {
     session = claimCopy(bot, task);
   }
   fs.mkdirSync(cwd, { recursive: true });
+  return work({ name: session, args: ["--session-dir", SESSIONS, "--session-id", session], fork, cwd, chain, signal, onProgress }, prompt)
+    .finally(() => release(session));
+}
+
+/**
+ * Works in a session, which `args` name to pi, through child pis: a turn on `prompt`, the first forked from `fork` when
+ * given, then a turn on any messages that came for `name` as it finished. Resolves to {ok, text, session}.
+ */
+function work({ name, args, fork, cwd, chain, signal, onProgress, file }, prompt) {
   const stop = new AbortController();
   signal?.addEventListener("abort", () => stop.abort(), { once: true });
-  const run = { name: session, steps: "", stop: () => stop.abort() };
+  const run = { name, file, steps: "", stop: () => stop.abort() };
   const steps = [];
   const step = (text) => {
-    steps.push(`${session}: ${oneLine(text)}`);
+    steps.push(`${name}: ${oneLine(text)}`);
     run.steps = steps.slice(-6).join("\n");
     shared.render?.();
-    onProgress(run.steps, session);
+    onProgress(run.steps, name);
   };
 
   /** One pi run in the session, which ends with the bot's turn; resolves to {ok, text}. */
   const turn = (text, fork) => new Promise((resolve) => {
-    const args = [piEntry(), "--mode", "json", "-p", "--session-dir", SESSIONS, "--session-id", session, ...(fork ? ["--fork", fork] : []),
-      "-e", SELF, text];
-    const child = spawn(process.execPath, args, {
+    const argv = [piEntry(), "--mode", "json", "-p", ...args, ...(fork ? ["--fork", fork] : []), "-e", SELF, text];
+    const child = spawn(process.execPath, argv, {
       cwd, env: { ...process.env, BOTMODE_CHAIN: chain.join(",") }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
     // ponytail: kills the bot's pi, not processes its tools started; kill the tree if strays appear.
@@ -418,14 +489,13 @@ function runBot(config, target, how, prompt, chain, signal, onProgress) {
         replies.push(outcome.text);
         // pi ends with the bot's turn, so a message that came as it finished would wait for its next task: it gets a turn now.
         // ponytail: at most 3 such turns, so two bots answering each other's answers stop; the rest waits for the next task.
-        next = turns < 3 ? takeMail(session).map(mailText).join("\n\n") : "";
+        next = turns < 3 ? takeMail(name).map(mailText).join("\n\n") : "";
       }
     } finally {
       shared.running.delete(run);
       shared.render?.();
-      release(session);
     }
-    return { ok: outcome.ok, text: [...replies, ...(outcome.ok ? [] : [outcome.text])].join("\n\n"), session };
+    return { ok: outcome.ok, text: [...replies, ...(outcome.ok ? [] : [outcome.text])].join("\n\n"), session: name };
   })();
 }
 
@@ -612,6 +682,10 @@ async function answer(req, res, secret, log) {
   const refused = refusal(config, chain, bot, prompt);
   if (refused) return send(res, 200, { ok: false, text: refused });
   log([...chain, `${MACHINE}/${bot}`].join(" -> "));
+  if (bot === HANDLER && session === "continue" && windowOpen()) { // Your handler takes it in its conversation, in your window.
+    post(HANDLER, { from: chain.at(-1), text: prompt });
+    return send(res, 200, { ok: true, text: `It is in ${MACHINE}'s window, where the handler works on it; its answer comes as a message.` });
+  }
   res.writeHead(200, { "content-type": "application/x-ndjson" }).flushHeaders();
   const stop = new AbortController();
   res.on("close", () => res.writableFinished || stop.abort()); // The caller pressed Esc or went away.
@@ -712,8 +786,25 @@ const replyText = (target, outcome) => `${outcome.session ?? target} ${outcome.o
 
 const WAIT = 10 * 60_000; // How long message waits for an answer before the answer comes as an ordinary message.
 
+// What a session hears when you leave it at work: pi stops a session's work as the window switches away from it.
+const CARRY_ON = "Carry on where you stopped: the owner stepped out of this session, which interrupted you, so redo a step that did not finish.";
+
+/** Carries on, in the background, with the work of a session this window has just left. */
+function carryOn({ session, file }) {
+  if (session) return runBot(loadConfig(), session, { session: "continue" }, CARRY_ON, [], undefined, () => {});
+  // Your handler's own conversation, which no lock guards: the window knows it is at work by this run.
+  work({ name: HANDLER, file, args: ["--session", file], cwd: startedIn(file) ?? process.cwd(), chain: [], onProgress: () => {} }, CARRY_ON);
+}
+
+/** Sends what you type to `to`: a session at work, or your handler's conversation, at work without you. */
+function tell(to, text) {
+  if (to !== HANDLER) return deliver(loadConfig(), to, HANDLER, text);
+  post(HANDLER, { text, reply: true }); // Your words as they are, at its next step.
+  return { ok: true, text: "Sent to your handler." };
+}
+
 export default function botmode(pi) {
-  let timer, watching;
+  let timer, watching, left;
   const waiting = new Map(); // address -> resolves message's wait with that address's next message.
 
   /** Applies this bot's tools and model from the configuration: at start, and when the handler changes itself. */
@@ -738,21 +829,28 @@ export default function botmode(pi) {
     if (!ctx.hasUI && ctx.isIdle()) return; // A worker reads messages only while it works; the rest wait for its next task.
     for (const message of takeMail(box)) {
       if (!message.reply && waiting.has(message.from)) waiting.get(message.from)(message.text);
-      else pi.sendMessage({ customType: "botmode", display: true, content: mailText(message) }, { triggerTurn: true, deliverAs: "steer" });
+      else pi.sendMessage({ customType: "botmode", display: true, content: mailText(message), details: { from: message.from } }, { triggerTurn: true, deliverAs: "steer" });
     }
   }
 
   pi.on("session_start", async (_event, ctx) => {
     const { session, box } = whoAmI(ctx);
-    // A bot's session that another pi works in: this window only shows it, writes nothing to it and leaves its mail alone.
-    watching = ctx.hasUI && session && !shared.entered.has(session) && holder(session) ? session : undefined;
+    const file = ctx.sessionManager.getSessionFile();
+    // A session that another pi works in, a bot's or your handler's own carrying on without you: this window only shows
+    // it, writes nothing to it and leaves its mail alone.
+    const atWork = () => session ? holder(session) : [...shared.running].some((run) => run.file === file);
+    watching = ctx.hasUI && !shared.entered.has(session) && atWork() ? session ?? HANDLER : undefined;
     if (!watching) await applySelf(ctx);
     if (box && !watching) {
       timer = setInterval(() => readMail(ctx, box), 500);
       timer.unref(); // A worker's pi exits when its task is done, whatever is still scheduled.
     }
     if (!ctx.hasUI) return;
-    if (!session) shared.home = ctx.sessionManager.getSessionFile();
+    if (!session) {
+      shared.home = file;
+      fs.mkdirSync(HOME, { recursive: true });
+      fs.writeFileSync(WINDOW, String(process.pid)); // Other machines' handlers now talk with yours here, where you see it.
+    }
     // ← on an empty prompt opens /sessions, as in Claude Code. Every key reaches this listener first, menus' too, and only
     // pi's prompt editor has onExtensionShortcut; the empty widget is how an extension gets hold of pi's screen, which
     // pi's RPC mode does not have.
@@ -766,16 +864,15 @@ export default function botmode(pi) {
     });
     if (watching) {
       // pi shows a session as it was when opened, so open it again whenever the bot writes to it, and when it is done.
-      const file = ctx.sessionManager.getSessionFile();
       const size = fs.statSync(file).size;
       timer = setInterval(() => {
-        if ((holder(watching) && fs.statSync(file, { throwIfNoEntry: false })?.size === size) || !atPrompt()) return;
+        if ((atWork() && fs.statSync(file, { throwIfNoEntry: false })?.size === size) || !atPrompt()) return;
         clearInterval(timer);
         pi.sendUserMessage(`/sessions ${watching}`, { expandPromptTemplates: true });
       }, 1000);
       timer.unref();
     }
-    ctx.ui.setStatus("botmode", watching ? `${session} is at work · what you type goes to it · ← sessions`
+    ctx.ui.setStatus("botmode", watching ? `${watching} is at work · what you type goes to it · ← sessions`
       : session && `${session} · ← or /sessions goes back to your handler`);
     shared.render = () => ctx.ui.setWidget("botmode", shared.running.size
       ? [...shared.running].map((run) => `⏳ ${run.steps.split("\n").at(-1) || `${run.name}: starting`}`) : undefined);
@@ -786,17 +883,27 @@ export default function botmode(pi) {
     clearInterval(timer);
     shared.render = undefined;
     const { session } = whoAmI(ctx);
+    // ponytail: with two windows open, the first to leave its handler's conversation sends the rest headless; track pids if that bites.
+    if (ctx.hasUI && !session) fs.rmSync(WINDOW, { force: true });
     if (event.targetSessionFile === ctx.sessionManager.getSessionFile()) return; // Opened again, as when a bot you watch is done.
     if (shared.entered.delete(session)) release(session); // You left it, so bots may work in it again.
+    if (left && ["resume", "new"].includes(event.reason)) carryOn(left); // You only left the room.
+  });
+
+  // pi stops a session's work before it closes it, so whether it was at work shows only as you set off.
+  pi.on("session_before_switch", (_event, ctx) => {
+    left = !ctx.isIdle() && { session: whoAmI(ctx).session, file: ctx.sessionManager.getSessionFile() };
   });
 
   pi.on("input", async (event, ctx) => {
     if (!watching || event.source === "extension") return { action: "continue" };
-    const sent = await deliver(loadConfig(), watching, HANDLER, event.text);
+    const sent = await tell(watching, event.text);
     ctx.ui.notify(sent.text, sent.ok ? "info" : "warning");
     if (!sent.ok) ctx.ui.setEditorText(event.text); // It has just finished; send it again once the window has it.
     return { action: "handled" };
   });
+
+  pi.registerMessageRenderer("botmode", (message, _options, theme) => messageView(message, theme));
 
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
@@ -822,6 +929,7 @@ export default function botmode(pi) {
       folder: { type: "string", description: "Only with fresh or copy: the absolute path of the folder the new copy works in, on the bot's machine" },
       task: { type: "string", description: "The complete task, with every requirement and the context the bot needs to work alone" },
     } },
+    renderCall: (args, theme, context) => callView("handoff", args.bot, ` · ${args.session}${args.folder ? ` in ${args.folder}` : ""}`, args.task, theme, context),
     async execute(_id, params, signal, onUpdate, ctx) {
       const config = loadConfig();
       const me = whoAmI(ctx);
@@ -838,7 +946,7 @@ export default function botmode(pi) {
       const done = handOver(config, params.bot, how, prompt, chain, undefined, () => {});
       const early = await Promise.race([done, new Promise((resolve) => setTimeout(resolve, 1000))]); // A refusal comes back at once.
       if (early) return result(replyText(params.bot, early));
-      done.then((outcome) => post(me.box, { text: replyText(params.bot, outcome), reply: true }));
+      done.then((outcome) => post(me.box, { from: outcome.session ?? params.bot, text: replyText(params.bot, outcome), reply: true }));
       return result(`${params.bot} is working on it in the background. Its reply reaches you as a message; carry on meanwhile.`);
     },
   });
@@ -855,6 +963,7 @@ export default function botmode(pi) {
       text: { type: "string", description: "The message" },
       wait: { type: "boolean", description: "Wait for their answer (up to 10 minutes) and get it as this tool's result" },
     } },
+    renderCall: (args, theme, context) => callView("message", args.to, args.wait ? " · waits for the answer" : "", args.text, theme, context),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const sent = await deliver(loadConfig(), params.to, whoAmI(ctx).box ?? HANDLER, params.text, signal);
       if (!sent.ok || !params.wait) return result(sent.text);
@@ -892,17 +1001,13 @@ export default function botmode(pi) {
     },
   });
 
-  /** Leaving a session stops what it is doing, so ask first while it works. */
-  const mayLeave = (ctx) => ctx.isIdle() || ctx.ui.confirm("Leave this session?", "It is still working, and leaving stops it.");
-
   /**
    * Opens a bot session in this window: an idle one to talk with, and no handoff runs in it while it is open there; one at
-   * work to watch, which the window takes over once the bot is done.
+   * work to watch, which the window takes over once the bot is done. The session you leave carries on if it is at work.
    */
   async function focus(ctx, session) {
     const file = sessionFiles().get(session);
     if (!file) return watch(ctx, session, holder(session)?.task); // A new copy has no session to show before its first step.
-    if (!(await mayLeave(ctx))) return;
     const entering = claim(session, "open in your window");
     if (entering) shared.entered.add(session);
     const switched = await ctx.switchSession(file).catch((error) => { // pi refuses a session whose folder is gone.
@@ -920,7 +1025,7 @@ export default function botmode(pi) {
     const run = [...shared.running].find((entry) => entry.name === name);
     const actions = new Map([[`Send ${name} a message`, async () => {
       const text = await ctx.ui.input(`Message to ${name}`, "It reaches the bot at its next step, or right after it finishes");
-      if (text?.trim()) ctx.ui.notify((await deliver(loadConfig(), name, HANDLER, text)).text, "info");
+      if (text?.trim()) ctx.ui.notify((await tell(name, text)).text, "info");
     }]]);
     if (run) actions.set(`Stop ${name}`, () => run.stop());
     const choice = await ctx.ui.select(`${name} · ${task ?? "working"}${run?.steps ? `\n${run.steps}` : ""}`, [...actions.keys()]);
@@ -928,17 +1033,18 @@ export default function botmode(pi) {
   }
 
   pi.registerCommand("sessions", {
-    description: "See every bot session and open one to talk with that bot, or watch it work; /sessions <id> opens that one",
+    description: "See every bot session and open one to talk with that bot, or watch it work; /sessions <id> opens that one, and /sessions handler your own",
     async handler(args, ctx) {
       const config = loadConfig();
       const here = whoAmI(ctx).session;
       const busy = new Map(working().map((session) => [session.id, session.task]));
       const files = sessionFiles();
-      if (args.trim()) {
-        return files.has(args.trim()) || busy.has(args.trim()) ? focus(ctx, args.trim()) : ctx.ui.notify(`There is no session ${args.trim()} here.`, "warning");
-      }
-      const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}`,
-        async () => here && await mayLeave(ctx) && ctx.switchSession(shared.home)]]);
+      const id = args.trim();
+      if (id === HANDLER) return ctx.switchSession(shared.home); // Your handler's conversation.
+      if (id) return files.has(id) || busy.has(id) ? focus(ctx, id) : ctx.ui.notify(`There is no session ${id} here.`, "warning");
+      const homeAtWork = [...shared.running].some((run) => run.file === shared.home);
+      const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}${homeAtWork ? " · working" : ""}`,
+        () => here ? ctx.switchSession(shared.home) : watching && watch(ctx, HANDLER)]]);
       for (const session of new Set([...files.keys(), ...busy.keys()])) {
         // handler here is another machine's handler talking with this one, not a bot of yours; skip removed bots too.
         if (session === HANDLER || !Object.hasOwn(config.bots, botOf(session))) continue;
@@ -974,7 +1080,7 @@ export default function botmode(pi) {
       ctx.ui.setStatus("botmode", `${target} is working…`);
       const outcome = await handOver(config, target, { session: "continue" }, message, chain, undefined, (steps) => ctx.ui.setStatus("botmode", steps.split("\n").at(-1)));
       ctx.ui.setStatus("botmode", undefined);
-      pi.sendMessage({ customType: "botmode", display: true,
+      pi.sendMessage({ customType: "botmode", display: true, details: { from: target },
         content: `You -> ${target}: ${message}\n\n${target}${outcome.ok ? "" : " failed"}: ${outcome.text}` });
     },
   });

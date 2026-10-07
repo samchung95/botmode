@@ -5,7 +5,7 @@
   "license": "UNLICENSED",
   "type": "module",
   "bin": { "botmode": "cli.mjs" },
-  "files": ["botmode.mjs", "cli.mjs", "README.md"],
+  "files": ["botmode.mjs", "botmode-tui.mjs", "cli.mjs", "README.md"],
   "scripts": { "test": "node --test botmode.test.mjs" },
   "dependencies": { "@earendil-works/pi-coding-agent": "0.99.1" },
   "engines": { "node": ">=22.19.0" }
