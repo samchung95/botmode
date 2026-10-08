@@ -60,7 +60,8 @@ async function step(tool, input, run) {
 const used = prompt.match(/^use (\w+) (\{.*\})$/m);
 const output = used ? await step(`mcp__botmode__${used[1]}`, JSON.parse(used[2]), () => use(used[1], JSON.parse(used[2]))) : "";
 if (prompt.includes("slow")) await step("Bash", { command: "sleep 2" }, () => new Promise((resolve) => setTimeout(resolve, 2000)));
-const how = prompt.includes("how") ? ` · ${flag("--model") ?? "default model"}, ${flag("--permission-mode")}, ← ${settings.leftArrowOpensAgents ? "opens agents" : "edits"}, ` +
+// As in Claude Code, which reads leftArrowOpensAgents only from the owner's own config, where it is on unless they turned it off.
+const how = prompt.includes("how") ? ` · ${flag("--model") ?? "default model"}, ${flag("--permission-mode")}, ← ${settings.disableAgentView ? "edits" : "opens agents"}, ` +
   `as "${flag("--append-system-prompt").split("\n")[0]}"` : "";
 const text = `${session} heard: ${lines(id).slice(1).map((line) => line.text).join(" | ")}${how}${output && ` · ${output}`}`;
 emit({ type: "assistant", message: { content: [{ type: "text", text }] } });

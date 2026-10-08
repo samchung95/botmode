@@ -424,13 +424,14 @@ function newFile(session, fields) {
 /**
  * How Claude Code runs `session` for the team, before the flags that pick its conversation: with no permission prompts, as
  * its bot with the team's prompt, and with handoff and message from botmode-claude.mjs, which also hands it its messages
- * after each step. ← on an empty prompt edits, as everywhere else, instead of opening Claude Code's agents: the lobby is ours.
+ * after each step. ← on an empty prompt edits, as everywhere else, instead of opening Claude Code's agents, which would take
+ * the conversation out of Botmode: the lobby is ours. Claude Code reads leftArrowOpensAgents only from the owner's own config.
  * The team's tools are its only MCP tools, and Claude Code's own messages to the owner's other Claude Code sessions are off.
  */
 async function claudeArgs(config, session, chain) {
   const bot = config.bots[botOf(session)];
   const bridge = (mode) => `node "${BRIDGE.replaceAll("\\", "/")}" ${mode} ${session}`; // Claude Code runs these in a shell.
-  const settings = { leftArrowOpensAgents: false, statusLine: { type: "command", command: bridge("status") },
+  const settings = { disableAgentView: true, statusLine: { type: "command", command: bridge("status") },
     hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: bridge("mail") }] }] } };
   // All the bridge needs to work for this session on this machine, whatever Claude Code passes on of its own.
   const env = { BOTMODE_HOME: HOME, BOTMODE_MACHINE: MACHINE, BOTMODE_PI: piEntry(), BOTMODE_CHAIN: chain.join(","),

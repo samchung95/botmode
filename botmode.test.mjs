@@ -515,7 +515,7 @@ test("a bot in Claude Code hears messages after each step, and hands work to the
   }
 });
 
-test("the lobby opens a bot in Claude Code in a room of its own, where ← edits, and one at work to watch", async () => {
+test("the lobby opens a bot in Claude Code in a room of its own, and one at work to watch", async () => {
   const asked = [];
   const rooms = http.createServer(async (req, res) => {
     let body = "";
@@ -534,7 +534,6 @@ test("the lobby opens a bot in Claude Code in a room of its own, where ← edits
     assert.ok(shown.includes(`coder · idle · just now · ${path.join(HOME, "bots", "coder")} · Claude Code`), shown.join("\n"));
     const [{ open: room, claude, args, cwd }] = asked.filter((message) => message.open);
     assert.deepEqual([room, claude, cwd], ["coder", true, path.join(HOME, "bots", "coder")]);
-    assert.equal(JSON.parse(args[args.indexOf("--settings") + 1]).leftArrowOpensAgents, false);
     assert.equal(args.at(-2), "--resume");
     assert.match(fs.readFileSync(path.join(HOME, "claude", `${args.at(-1)}.jsonl`), "utf-8"), /how do you run/); // coder's own conversation.
     // A bot at work you watch, in Claude Code too.

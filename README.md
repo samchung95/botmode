@@ -58,9 +58,9 @@ A bot with `"agent": "claude"` works in Claude Code instead of pi, for example `
 - Handed a task, it runs Claude Code headless in its folder, with all of Claude Code's tools and no permission prompts (`bypassPermissions`). Its `model` is a Claude Code model, such as `opus`, `sonnet` or a full model id. Left empty, it gets Claude Code's default, not `defaults.model`. It has no `tools` field.
 - It is on the team like any bot. Botmode gives it `handoff` and `message` as an MCP server, `botmode-claude.mjs`, so it hands work to bots in pi and messages them and your handler. A message to it reaches it after its next step, through a PostToolUse hook. One that arrives as it finishes gets a turn of its own, as in pi.
 - Sessions, copies and folders work as they do in pi.
-- In the lobby it is marked `Claude Code`. Pick an idle one to talk with it yourself, in Claude Code, in a room of its own. There, ← on an empty prompt does not open Claude Code's agents (`leftArrowOpensAgents` is off), and `/exit` brings you back to your handler. Pick one at work to message or stop it. Without rooms, you hand it work instead.
+- In the lobby it is marked `Claude Code`. Pick an idle one to talk with it yourself, in Claude Code, in a room of its own. There, ← on an empty prompt does not open Claude Code's agents, which would take the conversation out of Botmode (Botmode sets `disableAgentView`; Claude Code reads `leftArrowOpensAgents` only from your own config), and `/exit` brings you back to your handler. Pick one at work to message or stop it. Without rooms, you hand it work instead.
 - It is your Claude Code: your sign-in, settings, `CLAUDE.md` files, plugins and hooks. Your other MCP servers are left out, so its only MCP tools are the team's. So is Claude Code's `SendMessage`, which would reach your other Claude Code sessions.
-- The first time you open a bot's folder in Claude Code yourself, Claude Code asks whether you trust it. Handoffs never ask.
+- The first time you open a bot's folder in Claude Code yourself, Claude Code asks whether you trust it. For your home folder it asks every time, so give such a bot a folder of its own. Handoffs never ask.
 
 ## Several machines
 
