@@ -907,19 +907,25 @@ test("a helper model names each conversation with your handler after its task; w
   }
 });
 
-test("Ctrl+Enter sends what you typed to a new conversation with your handler, as /task does", async () => {
+test("Alt+Shift+Enter, or Ctrl+Enter, sends what you typed to a new conversation with your handler, as /task does", async () => {
   const handler = await open();
+  const windows = process.platform === "win32";
   try {
-    assert.equal(handler.press("\x1b[13;5u"), undefined); // Nothing typed: Ctrl+Enter is pi's again.
+    assert.equal(handler.press("\x1b[13;4u"), undefined); // Nothing typed: the key is pi's again.
     handler.screen.text = "fix the build";
-    assert.deepEqual(handler.press("\x1b[13;5u"), { consume: true });
+    assert.deepEqual(handler.press("\x1b[13;4u"), { consume: true }); // Alt+Shift+Enter, from a terminal that tells it apart.
     assert.equal(handler.screen.text, "");
     handler.screen.text = "and the docs";
-    assert.deepEqual(handler.press("\x1b[27;5;13~"), { consume: true }); // Terminals that report keys the older way.
+    // Windows sends Alt+Shift+Enter as Alt+Enter, which pi leaves free there; elsewhere Alt+Enter is pi's follow-up.
+    assert.deepEqual(handler.press("\x1b\r"), windows ? { consume: true } : undefined);
+    handler.screen.text = "and the tests";
+    assert.deepEqual(handler.press("\x1b[13;5u"), { consume: true }); // Ctrl+Enter
+    handler.screen.text = "and the README";
+    assert.deepEqual(handler.press("\x1b[27;4;13~"), { consume: true }); // Terminals that report keys the older way.
     handler.screen.text = "a menu is open";
     handler.screen.menu = true;
-    assert.equal(handler.press("\x1b[13;5u"), undefined);
-    assert.deepEqual(handler.dispatched, ["/task fix the build", "/task and the docs"]);
+    assert.equal(handler.press("\x1b[13;4u"), undefined);
+    assert.deepEqual(handler.dispatched, ["/task fix the build", ...(windows ? ["/task and the docs"] : []), "/task and the tests", "/task and the README"]);
   } finally {
     handler.close();
   }

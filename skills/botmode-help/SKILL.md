@@ -18,7 +18,7 @@ The owner runs these in a terminal:
 You may run `botmode status` yourself. The others ask questions or print the secret, so tell the owner which to run.
 
 In the window:
-- `/task <message>`, or Ctrl+Enter on what the owner typed, starts a new conversation with you, apart from the current one, in a room of its own; pi's `/new` does the same. Each conversation has an address, `handler.1`, `handler.2`…, where its bots' replies and messages reach it.
+- `/task <message>`, or Alt+Shift+Enter on what the owner typed (or Ctrl+Enter, where the terminal tells it apart), starts a new conversation with you, apart from the current one, in a room of its own; pi's `/new` does the same. Each conversation has an address, `handler.1`, `handler.2`…, where its bots' replies and messages reach it.
 - `/sessions`, or ← on an empty prompt, is the lobby: your conversations from every folder at the top, named after their task in your colour, then the bot sessions. `/sessions <id>` opens a session or a conversation.
 - `/bot <id> <message>` talks to one bot directly.
 - `/model` changes the model of this session.
@@ -63,5 +63,5 @@ Every bot, you included, works through billion-context: a proxy between it and i
 - **A bot's model requests fail with a connection error.** They go through billion-context's proxy. Its log, `~/.local/state/billion-context/bili.log`, says why. A bot in Claude Code gets a new proxy when it next starts; a bot in pi, on its next run.
 - **`botmode update` says EBUSY.** Another botmode window is using its files: close every other window, then run it again.
 - **Every room closed at once.** Quitting your own room closes them all and stops their work.
-- **Ctrl+Enter types a new line, or sends the message here, instead of starting a task.** The terminal does not tell Ctrl+Enter apart. `/task <message>` works in any terminal. In Windows Terminal, the owner adds `{"command": {"action": "sendInput", "input": "\u001b[13;5u"}, "keys": "ctrl+enter"}` to the `actions` in its settings; Ctrl+J still types a new line.
+- **The task key types a new line, sends the message here, or does nothing.** On Windows, Ctrl+Enter is pi's new line; Alt+Shift+Enter starts a task in any terminal there. On Mac and Linux, only terminals that tell modified Enter keys apart (the kitty keyboard protocol or xterm's modifyOtherKeys) pass either key on. `/task <message>` works in any terminal.
 - **Conversations in the lobby have no names, only their first words.** There is no helper model, or it is unavailable. `/botmode` sets one; only conversations in the window are named, once each.

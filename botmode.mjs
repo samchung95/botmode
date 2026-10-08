@@ -1161,6 +1161,8 @@ const WAIT = 10 * 60_000; // How long message waits for an answer before the ans
 
 // How many of your handler's conversations the lobby lists, newest first: pi's menu does not scroll. `botmode -r` has the rest.
 const LOBBY = 20;
+// Alt+Shift+Enter (4) and Ctrl+Enter (5) as the kitty keyboard protocol and xterm's modifyOtherKeys report them.
+const TASK_KEY = /^\x1b\[(?:13;[45](?::1)?u|27;[45];13~)$/;
 
 // What a session hears when you leave it at work: pi stops a session's work as the window switches away from it.
 const CARRY_ON = "Carry on where you stopped: the owner stepped out of this session, which interrupted you, so redo a step that did not finish.";
@@ -1282,10 +1284,11 @@ export default function botmode(pi) {
     let screen;
     const atPrompt = () => !screen || "onExtensionShortcut" in (screen.getFocusedComponent() ?? {});
     ctx.ui.setWidget("botmode-keys", (tui) => (screen = tui, { render: () => [], invalidate: () => {} }), { placement: "belowEditor" });
-    // Ctrl+Enter sends what you typed as /task does, in terminals that tell it from Enter (the kitty or xterm way).
+    // Alt+Shift+Enter, or Ctrl+Enter, sends what you typed as /task does, in terminals that tell it from Enter (the kitty
+    // or xterm way). Windows sends Alt+Shift+Enter as Alt+Enter, which pi leaves free there, and Ctrl+Enter as pi's new line.
     ctx.ui.onTerminalInput((key) => {
       const text = ctx.ui.getEditorText();
-      const task = /^\x1b\[(?:13;5(?::1)?u|27;5;13~)$/.test(key) && text.trim();
+      const task = (TASK_KEY.test(key) || (process.platform === "win32" && key === "\x1b\r")) && text.trim();
       if (!(task || (["\x1b[D", "\x1bOD"].includes(key) && !text)) || !atPrompt()) return;
       if (task) ctx.ui.setEditorText("");
       pi.sendUserMessage(task ? `/task ${task}` : "/sessions", { expandPromptTemplates: true });
@@ -1538,7 +1541,7 @@ export default function botmode(pi) {
   });
 
   pi.registerCommand("task", {
-    description: "Start a new conversation with your handler, apart from this one, with this message: /task <message>. Ctrl+Enter sends what you typed the same way",
+    description: "Start a new conversation with your handler, apart from this one, with this message: /task <message>. Alt+Shift+Enter, or Ctrl+Enter, sends what you typed the same way",
     async handler(args, ctx) {
       const file = newConversation(ctx.cwd);
       const id = idOf(path.basename(file));
