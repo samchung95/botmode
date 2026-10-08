@@ -53,6 +53,7 @@ async function open(session, { window = !session } = {}) {
   const call = async (name, params) => (await tools[name].execute("call", params, undefined, undefined, ctx)).content[0].text;
   return { ctx, call, commands, sent, status, switched, notes, dispatched, screen,
     prompt: async () => (await events.before_agent_start({ type: "before_agent_start", systemPrompt: "pi's prompt" }, ctx)).systemPrompt,
+    skills: async () => (await events.resources_discover({ type: "resources_discover", cwd: HOME, reason: "startup" }, ctx))?.skillPaths ?? [],
     press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
     close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx),
     // pi switching this window to another session: it asks first, stops what this one does, then closes it.
@@ -82,8 +83,7 @@ test("the handler creates a bot that then appears in the roster", () => {
   const config = JSON.parse(fs.readFileSync(path.join(HOME, "config.json"), "utf-8"));
   assert.equal(config.bots.research.name, "Researcher");
   assert.match(teamPrompt(config, "handler"), /- research \(Researcher\): Finds and summarizes sources/);
-  assert.match(teamPrompt(config, "handler"), /Current configuration:/);
-  assert.doesNotMatch(teamPrompt(config, "research"), /Current configuration:|- research/);
+  assert.doesNotMatch(teamPrompt(config, "research"), /configure-team|- research/);
 });
 
 test("a bad patch changes nothing and lists every problem", () => {
@@ -567,7 +567,7 @@ test("the handler archives a copy, or a whole bot, which leaves the lobby and th
     await handler.commands.sessions.handler("", handler.ctx);
     return shown.map((option) => option.split(" · ")[0]);
   };
-  const sessionsLine = async () => (await handler.prompt()).match(/^Bot sessions on this machine: (.*)$/m)?.[1].split(", ") ?? [];
+  const sessionsLine = async () => (await handler.call("configure", { patch: {} })).match(/^Bot sessions on this machine: (.*)$/m)?.[1].split(", ") ?? [];
   const gone = /^(research\.2|coder(\.\d+)?)$/;
   const server = serve(0);
   await once(server, "listening");
@@ -594,5 +594,48 @@ test("the handler archives a copy, or a whole bot, which leaves the lobby and th
   } finally {
     server.close();
     handler.close();
+  }
+});
+
+test("archiving a session at work stops it, and no one can message it", async () => {
+  const handler = await open();
+  try {
+    assert.match(await handler.call("handoff", { bot: "research", session: "fresh", task: "slow: long survey" }), /working on it in the background/);
+    await until(() => working().some((session) => /^research\.\d+$/.test(session.id)));
+    const copy = working().find((session) => /^research\.\d+$/.test(session.id)).id;
+    assert.match(await handler.call("configure", { patch: { bots: { research: { archived: [copy] } } } }), /^Applied/);
+    assert.equal(await handler.call("message", { to: copy, text: "still there?" }), `Refused: ${copy} is archived.`);
+    await until(() => handler.sent.length);
+    assert.equal(handler.sent[0].content, `${copy} failed: Stopped: ${copy} was archived.`);
+    assert.ok(!working().some((session) => session.id === copy));
+  } finally {
+    applyPatch({ bots: { research: { archived: null } } });
+    handler.close();
+  }
+});
+
+test("the handler changes the team with the configure-team skill, which it loads only when it needs it", async () => {
+  // Its prompt names the skill instead of carrying the configuration and its fields every turn.
+  assert.match(teamPrompt(loadConfig(), "handler"), /load the configure-team skill/);
+  assert.doesNotMatch(teamPrompt(loadConfig(), "handler"), /"bots":|workspace/);
+  const handler = await open();
+  let research;
+  try {
+    research = await open("research");
+    const [skill, ...more] = await handler.skills();
+    assert.equal(more.length, 0);
+    assert.deepEqual(await research.skills(), []); // Only the handler configures.
+    const guide = fs.readFileSync(path.join(skill, "SKILL.md"), "utf-8");
+    assert.match(guide, /^---\nname: configure-team\ndescription: .+\n---\n/);
+    // Every field configure takes is in the guide.
+    const fields = applyPatch({ bots: { handler: { nope: 1 } } }).join().match(/allowed: ([^)]*)/)[1].split(", ");
+    for (const field of ["defaults", "hosts", ...fields]) assert.match(guide, new RegExp(`\`${field}`), field);
+    // An empty patch changes nothing and shows the configuration and the bot sessions here.
+    const shown = await handler.call("configure", { patch: {} });
+    assert.match(shown, /^The configuration is:\n\{\n {2}"defaults"/);
+    assert.match(shown, /^Bot sessions on this machine: (.+, )?research(, .+)?$/m);
+  } finally {
+    handler.close();
+    research?.close();
   }
 });

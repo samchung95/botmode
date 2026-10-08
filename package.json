@@ -5,7 +5,7 @@
   "license": "UNLICENSED",
   "type": "module",
   "bin": { "botmode": "cli.mjs" },
-  "files": ["botmode.mjs", "botmode-claude.mjs", "botmode-tui.mjs", "cli.mjs", "README.md"],
+  "files": ["botmode.mjs", "botmode-claude.mjs", "botmode-tui.mjs", "cli.mjs", "skills", "README.md"],
   "scripts": { "test": "node --test botmode.test.mjs" },
   "dependencies": { "@anthropic-ai/claude-code": "2.1.292", "@earendil-works/pi-coding-agent": "0.99.1" },
   "optionalDependencies": { "node-pty": "1.1.0" },

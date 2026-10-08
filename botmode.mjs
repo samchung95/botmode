@@ -69,15 +69,8 @@ export const DEFAULT = {
     },
   },
 };
-const FIELDS = "Bot fields: name and description (required; the description is what routing reads), title, instructions, " +
-  "model ('provider/model' or 'provider/model:thinking'; empty uses defaults.model), tools (pi tool names: " +
-  `${ALL_TOOLS.join(", ")}; omitted keeps pi's defaults, [] leaves only the team tools), workspace (an existing ` +
-  "absolute folder; omitted gives the bot its own folder), agent ('claude' makes it a coding bot that works in Claude " +
-  "Code, with all of Claude Code's tools and no permission prompts; its model is a Claude Code model such as opus or " +
-  "sonnet, empty for Claude Code's default; it has no tools field), archived (sessions of the bot that leave the lobby and " +
-  "take no handoffs: the bot's own id archives the whole bot, off the team with its copies, and a copy's id, such as " +
-  "research.2, only that copy; drop one from the list to bring it back as it was). Ids are lowercase slugs. hosts lists the owner's other " +
-  "machines, whose bots join the team as host/bot; only the owner sets hosts, in config.json.";
+// The handler's guide to configure: pi lists it by name and the handler reads it only when it changes the team.
+const SKILL = fileURLToPath(new URL("skills/configure-team", import.meta.url));
 
 // pi loads this file afresh for every session it opens, so what must outlive one lives here: the bots this process runs
 // ({name, steps, stop}), the bot sessions open in this window, the owner's own session, and how to redraw the window's list.
@@ -215,9 +208,10 @@ export function working() {
 }
 
 /** Why a message from `from` cannot reach `to` on this machine, or "". The handler's mailbox waits for its window. */
-function undeliverable(to, from, text) {
+function undeliverable(config, to, from, text) {
   if (typeof text !== "string" || !text.trim()) return "Refused: the message is empty.";
   if (to === from) return "Refused: that is you.";
+  if (archived(config, to)) return `Refused: ${to} is archived.`;
   if (to === HANDLER || (SESSION_ID.test(to) && holder(to))) return "";
   return `${to} is not working right now, so it reads no messages; hand it a task instead. Working now: ` +
     `${working().map((session) => session.id).join(", ") || "none"}.`;
@@ -382,9 +376,9 @@ const line = (id, bot) => `- ${id} (${bot.name}${bot.title ? `, ${bot.title}` : 
 
 /**
  * `remote` maps each host to {bots, working}, or to why they are unavailable; `busy` lists this machine's sessions at work,
- * as working() returns them, and `sessions` all its sessions, which the handler sees so it can archive them.
+ * as working() returns them.
  */
-export function teamPrompt(config, id, remote = {}, busy = [], sessions = []) {
+export function teamPrompt(config, id, remote = {}, busy = []) {
   const bot = config.bots[id];
   const identity = `You are ${bot.name}${bot.title ? `, ${bot.title}` : ""}. ${bot.description}`;
   const reachable = Object.entries(remote).filter(([, team]) => typeof team !== "string");
@@ -402,21 +396,16 @@ export function teamPrompt(config, id, remote = {}, busy = [], sessions = []) {
       "description to that bot with handoff, and relay its reply. A bot that needs a while works in the background, and " +
       "its reply reaches you later as a message, so hand independent tasks out together and they run in parallel. Bots " +
       "may message you with questions; answer with message, asking the owner first when only the owner knows. When the " +
-      `owner asks to change the team, including you (bots.${HANDLER}: your tools, model and instructions), change it with ` +
-      "configure and confirm what changed. When no bot fits recurring work, offer to create one, and offer to archive bots " +
-      "and copies whose work is done."
+      `owner asks to change the team, including you (bots.${HANDLER}: your tools, model and instructions), load the ` +
+      "configure-team skill, change it with configure, and confirm what changed. When no bot fits recurring work, offer to " +
+      "create one; a bot for coding work can work in Claude Code, which Botmode brings to this machine. Offer to archive " +
+      "bots and copies whose work is done."
     : "You are one bot on a team. When a task, or part of one, fits another bot's description better than yours, hand it " +
       "over with handoff and use its reply. Bots at work can be reached with message: share what they need, or ask; " +
       "when only the owner can decide, message handler and wait for the answer.";
   const team = reachable.length ? "Team (a host/bot id is a bot on another of the owner's machines)" : "Team";
-  const parts = [identity, bot.instructions, role, `${team}:\n${roster || "(no other bots yet)"}`,
-    atWork && `Working right now (reach them with message):\n${atWork}`];
-  if (id === HANDLER) {
-    const listed = sessions.filter((session) => inLobby(config, session));
-    parts.push(listed.length && `Bot sessions on this machine: ${listed.join(", ")}`,
-      `Current configuration:\n${JSON.stringify(config, null, 2)}\n${FIELDS}`);
-  }
-  return parts.filter(Boolean).join("\n\n");
+  return [identity, bot.instructions, role, `${team}:\n${roster || "(no other bots yet)"}`,
+    atWork && `Working right now (reach them with message):\n${atWork}`].filter(Boolean).join("\n\n");
 }
 
 const oneLine = (text, size = 100) => {
@@ -584,7 +573,15 @@ function work({ name, args, first, claude, onStart, cwd, chain, signal, onProgre
     shared.running.add(run);
     step("starting");
     const replies = [];
-    let outcome = { ok: false, text: "Stopped before it started." }, next = prompt;
+    let outcome = { ok: false, text: "Stopped before it started." }, next = prompt, shelved = false;
+    // Archiving the session stops it, in whichever process on this machine runs it.
+    // ponytail: reads config.json every half second per session at work; signal stops some other way if many run at once.
+    const look = setInterval(() => {
+      try {
+        shelved = archived(loadConfig(), name);
+      } catch {} // An invalid config.json stops nothing.
+      if (shelved) stop.abort();
+    }, 500);
     try {
       for (let turns = 0; next && !stop.signal.aborted; turns++) {
         outcome = await turn(next, (!turns && first) || args);
@@ -595,9 +592,11 @@ function work({ name, args, first, claude, onStart, cwd, chain, signal, onProgre
         next = turns < 3 ? mailFor(name) : "";
       }
     } finally {
+      clearInterval(look);
       shared.running.delete(run);
       shared.render?.();
     }
+    if (shelved && !outcome.ok) outcome = { ok: false, text: `Stopped: ${name} was archived.` };
     return { ok: outcome.ok, text: [...replies, ...(outcome.ok ? [] : [outcome.text])].join("\n\n"), session: name };
   })();
 }
@@ -773,7 +772,7 @@ async function answer(req, res, secret, log) {
     const asked = Array.isArray(chain) && chain.at(-1) === `${MACHINE}/${HANDLER}`;
     const refused = to === HANDLER && !from.endsWith(`/${HANDLER}`) && !asked
       ? `Refused: ${MACHINE}'s handler hears only from your handler, and from bots at work on a task it handed them.`
-      : undeliverable(to, from, text);
+      : undeliverable(config, to, from, text);
     if (!refused) post(to, { from, text });
     return send(res, 200, { ok: !refused, text: refused || `Sent to ${to}.` });
   }
@@ -875,7 +874,7 @@ async function nextFrom(box, from, signal) {
 async function deliver(config, target, from, text, signal) {
   const [host, to] = address(target);
   if (host === undefined) {
-    const refused = undeliverable(to, from, text);
+    const refused = undeliverable(config, to, from, text);
     if (!refused) post(to, { from, text });
     return { ok: !refused, text: refused || `Sent to ${target}.` };
   }
@@ -1102,10 +1101,12 @@ export default function botmode(pi) {
 
   pi.registerMessageRenderer("botmode", (message, _options, theme) => messageView(message, theme));
 
+  pi.on("resources_discover", (_event, ctx) => whoAmI(ctx).bot === HANDLER ? { skillPaths: [SKILL] } : undefined);
+
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
     const me = whoAmI(ctx).bot;
-    const team = teamPrompt(config, me, await remoteTeams(config), working(), [...sessionFiles().keys()]);
+    const team = teamPrompt(config, me, await remoteTeams(config), working());
     // With only the team tools, pi's coding-assistant prompt would contradict the bot's own.
     return { systemPrompt: config.bots[me].tools?.length === 0 ? team : `${event.systemPrompt}\n\n${team}` };
   });
@@ -1159,14 +1160,20 @@ export default function botmode(pi) {
     name: "configure",
     label: "Configure",
     description: "Change the team's configuration with a JSON merge patch: objects merge, null deletes a key, other values " +
-      "replace. Creates, edits, archives and removes bots and sets defaults. The whole patch applies, or nothing does and the " +
-      "result lists every problem.",
+      "replace. Creates, edits, archives and removes bots and sets defaults; the configure-team skill has the fields. The " +
+      "whole patch applies, or nothing does and the result lists every problem. The empty patch {} changes nothing and " +
+      "shows the configuration and the bot sessions on this machine.",
     promptSnippet: "Create, edit, archive or remove team bots with a JSON merge patch",
     parameters: { type: "object", additionalProperties: false, required: ["patch"], properties: {
       patch: { type: "object", description: 'For example {"bots": {"research": {"name": "Researcher", "description": "Finds and summarizes sources"}}}' },
     } },
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (whoAmI(ctx).bot !== HANDLER) return result("Refused: only the handler changes the team.");
+      if (isObject(params.patch) && !Object.keys(params.patch).length) {
+        const config = loadConfig();
+        const sessions = [...sessionFiles().keys()].filter((session) => inLobby(config, session));
+        return result(`The configuration is:\n${JSON.stringify(config, null, 2)}\n\nBot sessions on this machine: ${sessions.join(", ") || "none yet"}`);
+      }
       const found = applyPatch(params.patch);
       if (found.length) return result(`Not applied; the configuration is unchanged:\n${found.join("\n")}`);
       await applySelf(ctx); // Your own new tools and model work from your next step on.
