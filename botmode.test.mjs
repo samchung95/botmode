@@ -9,16 +9,18 @@ import { fileURLToPath } from "node:url";
 
 process.env.BOTMODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "botmode-"));
 process.env.BOTMODE_MACHINE = "pc";
+process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-")); // pi's files, apart from your own pi's.
 process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs,
-process.env.BOTMODE_CLAUDE = fileURLToPath(new URL("fake-claude.mjs", import.meta.url)); // and Claude Code bots as fake-claude.mjs.
-const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, leavesClaude, loadConfig, mergePatch, problems,
+process.env.BOTMODE_CLAUDE = fileURLToPath(new URL("fake-claude.mjs", import.meta.url)); // and Claude Code bots as fake-claude.mjs,
+process.env.BOTMODE_BILI = fileURLToPath(new URL("fake-bili.mjs", import.meta.url)); // through fake-bili.mjs.
+const { default: botmode, BILLION_CONTEXT, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, leavesClaude, loadConfig, mergePatch, problems,
   readInvite, refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
 
 /**
  * Loads the extension the way pi does: in the owner's window (no session), or in a bot's session such as "research.2",
  * which a window shows when you enter it and a bot's own pi runs without one.
  */
-async function open(session, { window = !session } = {}) {
+async function open(session, { window = !session, theirs = [] } = {}) { // theirs: tools other extensions registered.
   const tools = {}, commands = {}, events = {}, sent = [], status = {}, switched = [], notes = [], dispatched = [];
   const screen = { text: "", menu: false }; // What is typed at the prompt, and whether a menu has the keyboard instead.
   let keys;
@@ -30,6 +32,7 @@ async function open(session, { window = !session } = {}) {
     registerMessageRenderer: () => {},
     sendUserMessage: (text) => dispatched.push(text),
     setActiveTools: (names) => { status.tools = names; },
+    getAllTools: () => theirs,
     setModel: async () => true,
     setThinkingLevel: () => {},
   });
@@ -55,6 +58,7 @@ async function open(session, { window = !session } = {}) {
     prompt: async () => (await events.before_agent_start({ type: "before_agent_start", systemPrompt: "pi's prompt" }, ctx)).systemPrompt,
     skills: async () => (await events.resources_discover({ type: "resources_discover", cwd: HOME, reason: "startup" }, ctx))?.skillPaths ?? [],
     press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
+    toolCall: (toolName) => events.tool_call?.({ type: "tool_call", toolCallId: "call", toolName, input: {} }, ctx),
     close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx),
     // pi switching this window to another session: it asks first, stops what this one does, then closes it.
     leave: async (targetSessionFile) => {
@@ -249,6 +253,43 @@ test("a new copy can work in a folder of its own, and keeps it", async () => {
   } finally {
     handler.close();
   }
+});
+
+test("bots in pi work with the MCP servers of pi-mcp-adapter, and only the handler asks the owner with ask_user_question", async () => {
+  const handler = await open();
+  let research;
+  try {
+    assert.match(await handler.call("handoff", { bot: "research", session: "fresh", task: "your extensions" }),
+      / with botmode\.mjs, node_modules\/pi-mcp-adapter\/index\.ts, node_modules\/billion-context\/dist\/agent\/pi-native\.js$/);
+    // The adapter's one tool is among pi's tools: the handler has it, as does a bot that names no tools.
+    research = await open("research");
+    assert.ok(handler.status.tools.includes("mcp") && research.status.tools.includes("mcp"));
+    // Only your handler's pi loads ask_user_question. A bot opened in its window keeps it, but its questions go to handler.
+    assert.equal(await handler.toolCall("ask_user_question"), undefined);
+    assert.deepEqual(await research.toolCall("ask_user_question"), { block: true, reason: "Only the handler asks the owner. Message handler with your question." });
+  } finally {
+    handler.close();
+    research?.close();
+  }
+});
+
+test("billion-context keeps every bot's context small: in pi, its tools stay on whatever tools a bot lists", async () => {
+  // Its extension registers the tools its proxy serves, such as compress; the handler lists its tools.
+  const handler = await open(undefined, { theirs: [{ name: "compress", sourceInfo: { path: BILLION_CONTEXT } },
+    { name: "lint", sourceInfo: { path: path.join(HOME, "lint.ts") } }] });
+  try {
+    assert.ok(handler.status.tools.includes("compress") && !handler.status.tools.includes("lint"));
+  } finally {
+    handler.close();
+  }
+});
+
+test("pi in Botmode leaves pi's own MCP on in your pi settings, for the pi you run yourself", async () => {
+  // pi-mcp-adapter turns pi's own MCP off in your pi settings unless its onboarding file says this version already has.
+  const onboarding = path.join(process.env.PI_CODING_AGENT_DIR, "mcp-onboarding.json");
+  fs.writeFileSync(onboarding, JSON.stringify({ version: 1, setupCompleted: true }));
+  (await open()).close();
+  assert.deepEqual(JSON.parse(fs.readFileSync(onboarding, "utf-8")), { version: 1, setupCompleted: true, piBuiltinMcpHandledVersion: "5.1.0" });
 });
 
 test("/sessions opens a bot at work to watch, what you type goes to it, and once it is done you talk with it", async () => {
@@ -663,9 +704,12 @@ test("archiving a session at work stops it, and no one can message it", async ()
   }
 });
 
-test("the handler changes the team, and sets up Claude Code profiles, with skills it loads only when it needs them", async () => {
-  // Its prompt names the skill instead of carrying the configuration and its fields every turn.
+test("the handler changes the team, sets up Claude Code profiles, clarifies and helps, with skills it loads only when it needs them", async () => {
+  // Its prompt names the skills instead of carrying the configuration and its fields every turn.
   assert.match(teamPrompt(loadConfig(), "handler"), /load the configure-team skill/);
+  assert.match(teamPrompt(loadConfig(), "handler"), /load the clarify skill/);
+  // Everyone on the team writes to the others, and to the owner, the same way.
+  for (const id of ["handler", "research"]) assert.match(teamPrompt(loadConfig(), id), /the point first/);
   assert.doesNotMatch(teamPrompt(loadConfig(), "handler"), /"bots":|workspace/);
   const handler = await open();
   let research;
@@ -676,8 +720,9 @@ test("the handler changes the team, and sets up Claude Code profiles, with skill
     assert.deepEqual(await research.skills(), []); // Only the handler configures.
     const guide = fs.readFileSync(path.join(skills, "configure-team", "SKILL.md"), "utf-8");
     assert.match(guide, /^---\nname: configure-team\ndescription: .+\n---\n/);
-    const profiles = fs.readFileSync(path.join(skills, "claude-code-profiles", "SKILL.md"), "utf-8");
-    assert.match(profiles, /^---\nname: claude-code-profiles\ndescription: .+\n---\n/);
+    for (const name of ["claude-code-profiles", "clarify", "botmode-help"]) {
+      assert.match(fs.readFileSync(path.join(skills, name, "SKILL.md"), "utf-8"), new RegExp(`^---\nname: ${name}\ndescription: .+\n---\n`));
+    }
     // Every field configure takes is in the guide.
     const fields = applyPatch({ bots: { handler: { nope: 1 } } }).join().match(/allowed: ([^)]*)/)[1].split(", ");
     for (const field of ["defaults", "hosts", ...fields]) assert.match(guide, new RegExp(`\`${field}`), field);
@@ -688,5 +733,18 @@ test("the handler changes the team, and sets up Claude Code profiles, with skill
   } finally {
     handler.close();
     research?.close();
+  }
+});
+
+test("billion-context keeps every bot's context small: bots in Claude Code go through its proxy, which Botmode runs", async () => {
+  const handler = await open();
+  try {
+    const via = / · context through (http:\/\/127\.0\.0\.1:\d+)\/bili\/https:\/\/api\.anthropic\.com, auto-compact off, MCP servers botmode, bili$/;
+    const first = await handler.call("handoff", { bot: "coder", session: "fresh", task: "your context" });
+    assert.match(first, via);
+    // Every bot in Claude Code on this machine goes through the same one.
+    assert.equal((await handler.call("handoff", { bot: "coder", session: "fresh", task: "your context" })).match(via)?.[1], first.match(via)[1]);
+  } finally {
+    handler.close();
   }
 });

@@ -1,6 +1,7 @@
 // Stands in for Claude Code in Botmode's tests: one `-p --output-format stream-json` run that keeps its conversations the
 // way Claude Code does, finding one only from the folder it started in. It replies "<session> heard: <every prompt in the
-// conversation>", adding how it runs when the prompt says "how". "use <tool> <json>" calls that tool through the MCP server
+// conversation>", adding how it runs when the prompt says "how", and where its model requests go when it says "context".
+// "use <tool> <json>" calls that tool through the MCP server
 // it was given; "slow" first works a while. After each step its PostToolUse hook runs, and what that adds it heard too.
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -67,6 +68,8 @@ if (prompt.includes("slow")) await step("Bash", { command: "sleep 2" }, () => ne
 // As in Claude Code, which reads leftArrowOpensAgents only from the owner's own config, where it is on unless they turned it off.
 const how = prompt.includes("how") ? ` · ${flag("--model") ?? "default model"}, ${flag("--permission-mode")}, ← ${settings.disableAgentView ? "edits" : "opens agents"}, ` +
   `as "${flag("--append-system-prompt").split("\n")[0]}"${loaded.length ? `, loading ${loaded.join(", ")}` : ""}` : "";
-const text = `${session} heard: ${lines(id).slice(1).map((line) => line.text).join(" | ")}${how}${output && ` · ${output}`}`;
+const context = prompt.includes("context") ? ` · context through ${settings.env?.ANTHROPIC_BASE_URL ?? "nothing"}, auto-compact ` +
+  `${settings.env?.DISABLE_AUTO_COMPACT === "1" ? "off" : "on"}, MCP servers ${Object.keys(JSON.parse(configs.at(-1)).mcpServers).join(", ")}` : "";
+const text = `${session} heard: ${lines(id).slice(1).map((line) => line.text).join(" | ")}${how}${context}${output && ` · ${output}`}`;
 emit({ type: "assistant", message: { content: [{ type: "text", text }] } });
 emit({ type: "result", subtype: "success", is_error: false, result: text });

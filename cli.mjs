@@ -10,12 +10,15 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { HANDLER, HOME, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, leavesClaude, loadConfig, readInvite, release, remoteTeams,
-  saveToken, serve, setHost, token, working } from "./botmode.mjs";
+import { ASK_USER, BILLION_CONTEXT, HANDLER, HOME, MCP_ADAPTER, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, leavesClaude, loadConfig,
+  readInvite, release, remoteTeams, saveToken, serve, setHost, token, working } from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
 const EXTENSION = fileURLToPath(new URL("botmode.mjs", import.meta.url));
 const DRAWING = fileURLToPath(new URL("botmode-tui.mjs", import.meta.url)); // Lends botmode.mjs pi's TUI, for bots' colours.
+// The extensions of a pi in your window, and of your handler's, which alone asks you questions there.
+const LOADS = [EXTENSION, DRAWING, MCP_ADAPTER, BILLION_CONTEXT].flatMap((file) => ["-e", file]);
+const HANDLER_LOADS = [...LOADS, "-e", ASK_USER];
 // pi comes with this package. Its command is dist/bundle/cli.js, beside the dist/index.js the package exports.
 const PI = path.join(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
 process.env.BOTMODE_PI = PI;
@@ -534,7 +537,7 @@ function update() {
 
 function openHandler(args) {
   process.on("SIGINT", () => {}); // pi reads Ctrl+C itself; this process only waits for pi to exit.
-  spawn(process.execPath, [PI, "-e", EXTENSION, "-e", DRAWING, ...args], { stdio: "inherit" }).on("exit", (code) => process.exit(code ?? 1));
+  spawn(process.execPath, [PI, ...HANDLER_LOADS, ...args], { stdio: "inherit" }).on("exit", (code) => process.exit(code ?? 1));
 }
 
 /**
@@ -595,7 +598,7 @@ async function openWindow(args) {
     if (claude && !claim(name, OPEN)) return; // A handoff has just taken it.
     let term;
     try {
-      term = pty.spawn(claude ? CLAUDE : process.execPath, claude ? args : [PI, "-e", EXTENSION, "-e", DRAWING, ...args], {
+      term = pty.spawn(claude ? CLAUDE : process.execPath, claude ? args : [PI, ...(name === HANDLER ? HANDLER_LOADS : LOADS), ...args], {
         name: process.env.TERM || "xterm-256color", cols: process.stdout.columns, rows: process.stdout.rows, cwd,
         env: { ...process.env, BOTMODE_ROOMS: url, BOTMODE_ROOM: name },
       });

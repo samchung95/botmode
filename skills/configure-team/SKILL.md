@@ -30,7 +30,7 @@ Look before you change: `configure` with the empty patch `{}` changes nothing an
 - `title`: optional, a role such as "Researcher".
 - `instructions`: optional, added to the bot's system prompt.
 - `model`: `provider/model` or `provider/model:thinking`; empty uses `defaults.model`. For a bot in Claude Code, a Claude Code model such as `opus` or `sonnet`, or a full model id; empty uses Claude Code's default.
-- `tools`: pi tool names, from `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `powershell` on Windows. Omitted keeps pi's defaults (`read`, `bash`, `edit`, `write`); `[]` leaves only the team's tools, which every bot has.
+- `tools`: pi tool names, from `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `powershell` on Windows, and `mcp`, the owner's MCP servers (the botmode-help skill). Omitted keeps pi's defaults (`read`, `bash`, `edit`, `write`, `mcp`); `[]` leaves only the team's tools and billion-context's, for the bot's own context, which every bot has.
 - `workspace`: an existing absolute folder the bot works in. Omitted, it gets a folder of its own.
 - `agent`: `"claude"` for a bot that works in Claude Code; omitted, or `"pi"`, for one in pi.
 - `profile`: for a bot in Claude Code, the profile it loads, with skills, plugins and MCP servers. The claude-code-profiles skill sets them up.

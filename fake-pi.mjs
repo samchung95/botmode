@@ -1,6 +1,6 @@
 // Stands in for pi in Botmode's tests: one `--mode json -p` run that keeps its session file the way pi does.
-// It replies "<session id> heard: <every prompt in the session>", adds " in <its folder>" when the prompt says "where",
-// and first waits a while when the prompt says "slow", or FAKE_PI_SLOW is set.
+// It replies "<session id> heard: <every prompt in the session>", adds " in <its folder>" when the prompt says "where", and
+// " with <its extensions>" when it says "extensions", and first waits a while when the prompt says "slow", or FAKE_PI_SLOW is set.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -19,6 +19,8 @@ const say = (role, text) => fs.appendFileSync(file, `${JSON.stringify({ type: "m
 say("user", prompt);
 if (prompt.includes("slow") || process.env.FAKE_PI_SLOW) await new Promise((resolve) => setTimeout(resolve, 2000));
 const heard = lines(file).filter((entry) => entry.message?.role === "user").map((entry) => entry.message.content[0].text);
-const text = `${id ?? path.basename(file, ".jsonl")} heard: ${heard.join(" | ")}${prompt.includes("where") ? ` in ${process.cwd()}` : ""}`;
+const extensions = args.flatMap((arg, n) => arg === "-e" ? [path.relative(import.meta.dirname, args[n + 1]).replaceAll("\\", "/")] : []);
+const text = `${id ?? path.basename(file, ".jsonl")} heard: ${heard.join(" | ")}${prompt.includes("where") ? ` in ${process.cwd()}` : ""}` +
+  `${prompt.includes("extensions") ? ` with ${extensions.join(", ")}` : ""}`;
 say("assistant", text);
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } }));

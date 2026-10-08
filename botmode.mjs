@@ -5,8 +5,10 @@
 // they join the team as host/bot.
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
+import { once } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,8 +26,26 @@ const MAIL = path.join(HOME, "mail"); // One folder per session that reads messa
 const WINDOW = path.join(HOME, "window"); // The pid of the pi whose window has your handler's conversation open.
 // Profiles for bots in Claude Code, a folder each, with the skills, plugins and MCP servers they load (skills/claude-code-profiles).
 const PROFILES = path.join(HOME, "profiles");
+const PROXY = path.join(HOME, "bili"); // Where billion-context's proxy for bots in Claude Code listens (claudeProxy).
 const ABOVE = (process.env.BOTMODE_CHAIN || "").split(",").filter(Boolean); // machine/bot entries waiting on this bot, outermost first.
 const SELF = fileURLToPath(import.meta.url);
+// The pi extensions Botmode brings. Every pi it runs loads pi-mcp-adapter after this file: the MCP servers in your MCP config
+// files, behind one `mcp` tool. Only your handler's pi in your window loads ask_user_question, which asks you multiple-choice
+// questions there; a bot asks with message. Every pi loads billion-context's too (BILLION_CONTEXT).
+const extension = (name, file = "index.ts") => fileURLToPath(new URL(`node_modules/${name}/${file}`, import.meta.url));
+export const MCP_ADAPTER = extension("pi-mcp-adapter");
+export const ASK_USER = extension("@juicesharp/rpiv-ask-user-question");
+// billion-context keeps a bot's context small: a proxy between the bot and its model compresses what the bot no longer needs
+// word for word, and gives it tools to bring any of it back. In pi, this extension runs the proxy. Claude Code has no
+// extensions, so a bot there goes through a proxy Botmode runs (claudeProxy), with the tools from its MCP server.
+export const BILLION_CONTEXT = extension("billion-context", "dist/agent/pi-native.js");
+const BILI = process.env.BOTMODE_BILI || extension("billion-context", "dist/index.js"); // BOTMODE_BILI: a stand-in, in tests.
+const BILI_MCP = extension("billion-context", "dist/mcp.js");
+// Botmode's copy is pinned: it never updates itself, or checks for advisories and release notes to update by.
+Object.assign(process.env, { ACP_AUTO_UPDATE: "0", BILI_ADVISORY_CHECK: "0", BILI_RELEASE_NOTES_CHECK: "0" });
+// Nor does it bring acp_delegate, whose sub-agents would work with tools of their own outside Botmode: a bot hands work over
+// with handoff. billion-context leaves acp_delegate to an extension that claims it first in the same pi, as this file does.
+globalThis[Symbol.for("acp-delegate.embedded")] = true;
 // pi's entry script. Inside pi it is process.argv[1]; the `botmode` command sets BOTMODE_PI after importing this file.
 const piEntry = () => process.env.BOTMODE_PI || process.argv[1];
 // Claude Code, which bots with "agent": "claude" work in: the `botmode` command sets BOTMODE_CLAUDE to the one it comes with.
@@ -57,9 +77,9 @@ const BOT_FIELDS = {
   archived: ["list", false], // Its sessions out of the lobby and away from handoffs; its own id archives the whole bot.
 };
 const AGENTS = ["pi", "claude"];
-// All of pi's tools: files and the terminal, with the rights of the account Botmode runs as.
-export const ALL_TOOLS = ["read", "bash", ...(process.platform === "win32" ? ["powershell"] : []), "edit", "write", "grep", "find", "ls"];
-const DEFAULT_TOOLS = ["read", "bash", "edit", "write"]; // What pi turns on when a bot names no tools.
+// All of pi's tools: files and the terminal, with the rights of the account Botmode runs as, and MCP servers (MCP_ADAPTER).
+export const ALL_TOOLS = ["read", "bash", ...(process.platform === "win32" ? ["powershell"] : []), "edit", "write", "grep", "find", "ls", "mcp"];
+const DEFAULT_TOOLS = ["read", "bash", "edit", "write", "mcp"]; // What pi turns on when a bot names no tools.
 export const DEFAULT = {
   defaults: { model: "" },
   bots: {
@@ -400,19 +420,22 @@ export function teamPrompt(config, id, remote = {}, busy = []) {
   const atWork = [...busy, ...reachable.flatMap(([host, team]) => team.working.map((session) => ({ ...session, id: `${host}/${session.id}` })))]
     .map((session) => `- ${session.id}: ${session.task}`).join("\n");
   const role = id === HANDLER
-    ? "Every message from the owner reaches you first. Answer quick questions yourself. Hand work that fits another bot's " +
-      "description to that bot with handoff, and relay its reply. A bot that needs a while works in the background, and " +
-      "its reply reaches you later as a message, so hand independent tasks out together and they run in parallel. Bots " +
-      "may message you with questions; answer with message, asking the owner first when only the owner knows. When the " +
-      `owner asks to change the team, including you (bots.${HANDLER}: your tools, model and instructions), load the ` +
-      "configure-team skill, change it with configure, and confirm what changed. When no bot fits recurring work, offer to " +
-      "create one; a bot for coding work can work in Claude Code, which Botmode brings to this machine. Offer to archive " +
-      "bots and copies whose work is done."
+    ? "Every message from the owner reaches you first. When a request could mean more than one thing, such as which " +
+      "machine, bot, session or folder, load the clarify skill and ask before you act. Answer quick questions yourself. " +
+      "Hand work that fits another bot's description to that bot with handoff, and relay its reply. A bot that needs a " +
+      "while works in the background, and its reply reaches you later as a message, so hand independent tasks out " +
+      "together and they run in parallel. Bots may message you with questions; answer with message, asking the owner " +
+      `first when only the owner knows. When the owner asks to change the team, including you (bots.${HANDLER}: your ` +
+      "tools, model and instructions), load the configure-team skill, change it with configure, and confirm what changed. " +
+      "When no bot fits recurring work, offer to create one; a bot for coding work can work in Claude Code, which Botmode " +
+      "brings to this machine. Offer to archive bots and copies whose work is done."
     : "You are one bot on a team. When a task, or part of one, fits another bot's description better than yours, hand it " +
       "over with handoff and use its reply. Bots at work can be reached with message: share what they need, or ask; " +
       "when only the owner can decide, message handler and wait for the answer.";
+  const voice = "Write to anyone, the owner included, like a radio call: the point first (the answer, result, request or " +
+    "blocker), then only what they need to act on it, with exact names, paths, ids and numbers. No filler, one subject per message.";
   const team = reachable.length ? "Team (a host/bot id is a bot on another of the owner's machines)" : "Team";
-  return [identity, bot.instructions, role, `${team}:\n${roster || "(no other bots yet)"}`,
+  return [identity, bot.instructions, role, voice, `${team}:\n${roster || "(no other bots yet)"}`,
     atWork && `Working right now (reach them with message):\n${atWork}`].filter(Boolean).join("\n\n");
 }
 
@@ -429,6 +452,38 @@ function newFile(session, fields) {
   fs.writeFileSync(path.join(SESSIONS, name), `${JSON.stringify({ type: "session", ...fields })}\n`);
 }
 
+let starting; // A proxy claudeProxy is starting, which the bots that ask meanwhile wait for.
+
+/**
+ * The address of billion-context's proxy that bots in Claude Code on this machine go through: the one in PROXY while it
+ * answers, else a new one. It runs while the process that started it, or any that asked for it since, does. Without
+ * billion-context, or if it does not start, undefined, and Claude Code goes straight to its model.
+ */
+async function claudeProxy() {
+  if (!fs.existsSync(BILI)) return;
+  // Asking it to watch this process checks it answers, and keeps it running while this process does.
+  const watches = async (origin) => [200, 409].includes((await fetch(`${origin}/__bili/watcher`, { method: "POST",
+    headers: { "content-type": "application/json" }, body: JSON.stringify({ pid: process.pid }), signal: AbortSignal.timeout(2000) })
+    .catch(() => undefined))?.status);
+  const known = fs.existsSync(PROXY) && fs.readFileSync(PROXY, "utf-8").trim();
+  if (known && await watches(known)) return known;
+  starting ??= (async () => {
+    const free = net.createServer().listen(0, "127.0.0.1");
+    await once(free, "listening");
+    const origin = `http://127.0.0.1:${free.address().port}`;
+    free.close();
+    spawn(process.execPath, [BILI, "start", "--host", "127.0.0.1", "--port", new URL(origin).port], { detached: true, stdio: "ignore",
+      windowsHide: true, env: { ...process.env, BILI_PARENT_PID: String(process.pid), BILI_STRICT_PORT: "1", BILI_LAUNCHER_LANE: "claude" } }).unref();
+    for (const end = Date.now() + 15000; Date.now() < end; await new Promise((resolve) => setTimeout(resolve, 200))) {
+      if (await watches(origin)) {
+        fs.writeFileSync(PROXY, origin);
+        return origin;
+      }
+    }
+  })().finally(() => { starting = undefined; });
+  return starting;
+}
+
 /**
  * How Claude Code runs `session` for the team, before the flags that pick its conversation: with no permission prompts, as
  * its bot with the team's prompt, and with handoff and message from botmode-claude.mjs, which also hands it its messages
@@ -437,18 +492,23 @@ function newFile(session, fields) {
  * Claude Code's own messages to the owner's other Claude Code sessions are off. Its profile is a plugin, with more plugins in
  * its plugins folder. --strict-mcp-config leaves out every MCP server not in --mcp-config, the owner's and the plugins' alike,
  * so its MCP servers are the team's and those in its profile's .mcp.json, which comes first: a name's last config wins.
+ * Its model requests go through billion-context's proxy (claudeProxy), which compresses its context instead of Claude Code.
  */
 async function claudeArgs(config, session, chain) {
   const bot = config.bots[botOf(session)];
   const bridge = (mode) => `node "${BRIDGE.replaceAll("\\", "/")}" ${mode} ${session}`; // Claude Code runs these in a shell.
   const hook = (mode) => [{ hooks: [{ type: "command", command: bridge(mode) }] }];
+  const proxy = await claudeProxy();
+  const model = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/+$/, "");
   // Its turns in a room, which tell your window whether ← may go back to the lobby (see leavesClaude).
   const settings = { disableAgentView: true, statusLine: { type: "command", command: bridge("status") },
-    hooks: { PostToolUse: [{ matcher: "*", ...hook("mail")[0] }], UserPromptSubmit: hook("busy"), Stop: hook("idle"), StopFailure: hook("idle") } };
+    hooks: { PostToolUse: [{ matcher: "*", ...hook("mail")[0] }], UserPromptSubmit: hook("busy"), Stop: hook("idle"), StopFailure: hook("idle") },
+    ...(proxy && { env: { ANTHROPIC_BASE_URL: `${proxy}/bili/${model}`, DISABLE_AUTO_COMPACT: "1" } }) };
   // All the bridge needs to work for this session on this machine, whatever Claude Code passes on of its own.
   const env = { BOTMODE_HOME: HOME, BOTMODE_MACHINE: MACHINE, BOTMODE_PI: piEntry(), BOTMODE_CHAIN: chain.join(","),
     ...(process.env.BOTMODE_CLAUDE && { BOTMODE_CLAUDE: process.env.BOTMODE_CLAUDE }) };
-  const servers = { mcpServers: { botmode: { type: "stdio", command: process.execPath, args: [BRIDGE, "mcp", session], env } } };
+  const servers = { mcpServers: { botmode: { type: "stdio", command: process.execPath, args: [BRIDGE, "mcp", session], env },
+    ...(proxy && { bili: { type: "stdio", command: process.execPath, args: [BILI_MCP], env: { BILI_MCP_PROXY: proxy } } }) } };
   const team = `${teamPrompt(config, botOf(session), await remoteTeams(config), working())}\n\nhandoff and message are your ` +
     "mcp__botmode__handoff and mcp__botmode__message tools; they are your only way to the team.";
   const profile = bot.profile ? [path.join(PROFILES, bot.profile)] : [];
@@ -554,7 +614,7 @@ function work({ name, args, first, claude, onStart, cwd, chain, signal, onProgre
   /** One run of pi, or Claude Code, in the session, which ends with the bot's turn; resolves to {ok, text}. */
   const turn = (text, args) => new Promise((resolve) => {
     const [command, ...argv] = claude ? [...claudeCommand(), "-p", "--output-format", "stream-json", "--verbose", ...args, text]
-      : [process.execPath, piEntry(), "--mode", "json", "-p", ...args, "-e", SELF, text];
+      : [process.execPath, piEntry(), "--mode", "json", "-p", ...args, "-e", SELF, "-e", MCP_ADAPTER, "-e", BILLION_CONTEXT, text];
     const child = spawn(command, argv, {
       cwd, env: { ...process.env, BOTMODE_CHAIN: chain.join(",") }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
@@ -1027,7 +1087,28 @@ function tell(to, text) {
   return { ok: true, text: "Sent to your handler." };
 }
 
+/**
+ * pi-mcp-adapter turns pi's own MCP off in your pi settings, for every pi you run, unless its onboarding file says this
+ * version of it already has. Botmode's pis don't need that, since pi steps its own MCP aside for an extension that has
+ * /mcp, so this says so for the version package.json pins.
+ */
+function keepPiMcp() {
+  const dir = (process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent")).replace(/^~(?=$|[\\/])/, os.homedir());
+  const file = path.join(dir, "mcp-onboarding.json");
+  const version = JSON.parse(fs.readFileSync(new URL("package.json", import.meta.url), "utf-8")).dependencies["pi-mcp-adapter"];
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    state = { version: 1 }; // None yet, or one the adapter would not read either.
+  }
+  if (state.piBuiltinMcpHandledVersion === version) return;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ ...state, piBuiltinMcpHandledVersion: version }, null, 2)}\n`);
+}
+
 export default function botmode(pi) {
+  keepPiMcp();
   let timer, watching, left, beat;
   const waiting = new Map(); // address -> resolves message's wait with that address's next message.
   // Set when the botmode command runs your window as rooms, a pi per conversation (cli.mjs): where it listens, and this room.
@@ -1043,7 +1124,9 @@ export default function botmode(pi) {
     const bot = config.bots[me];
     if (!bot) throw new Error(`botmode: there is no bot '${me}' in ${CONFIG}.`);
     const teamTools = me === HANDLER ? ["handoff", "message", "configure"] : ["handoff", "message"];
-    pi.setActiveTools(bot.tools ? [...bot.tools, ...teamTools] : [...DEFAULT_TOOLS, ...teamTools]);
+    // billion-context's tools act only on the bot's own context, so they stay on whatever its tools say.
+    const context = pi.getAllTools().filter((tool) => tool.sourceInfo?.path === BILLION_CONTEXT).map((tool) => tool.name);
+    pi.setActiveTools([...bot.tools ?? DEFAULT_TOOLS, ...teamTools, ...context]);
     const spec = bot.model || config.defaults?.model;
     if (spec) {
       const { provider, id, thinking } = parseModel(spec);
@@ -1146,6 +1229,9 @@ export default function botmode(pi) {
   pi.registerMessageRenderer("botmode", (message, _options, theme) => messageView(message, theme));
 
   pi.on("resources_discover", (_event, ctx) => whoAmI(ctx).bot === HANDLER ? { skillPaths: [SKILLS] } : undefined);
+  // A bot's session opened in the window itself, without rooms, keeps the handler's ask_user_question (ASK_USER).
+  pi.on("tool_call", (event, ctx) => event.toolName === "ask_user_question" && whoAmI(ctx).bot !== HANDLER
+    ? { block: true, reason: "Only the handler asks the owner. Message handler with your question." } : undefined);
 
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
