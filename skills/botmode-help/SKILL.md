@@ -8,7 +8,7 @@ description: How to use Botmode and fix it. Its commands, where its files are, M
 ## Commands
 
 The owner runs these in a terminal:
-- `botmode`: the window, with you. `botmode -c` continues your last conversation in that folder, and `botmode -p "..."` sends you one message without the window.
+- `botmode`: the window, with you. It carries on your last conversation with the owner in the folder it starts in; `/new` starts a fresh one, and `botmode -r` picks another. `botmode -p "..."` sends you one message without the window, in that same conversation.
 - `botmode setup`: model sign-in, the bots' model, Claude Code's sign-in, and letting other machines connect. `botmode setup <invite>` connects this machine to the one that printed the invite.
 - `botmode invite`: prints the invite again. It holds the secret the machines share, so the owner sends it only to themselves.
 - `botmode status`: sign-ins, model, bots, host, tailnet, what is at work, and the other machines.
@@ -23,6 +23,7 @@ In the window: `/sessions`, or ← on an empty prompt, is the lobby; `/sessions 
 
 Botmode keeps its files in `~/.botmode` (`$BOTMODE_HOME`):
 - `config.json`: the team. Change it with `configure`, not by hand.
+- `handler/`: your conversations with the owner.
 - `sessions/`: every bot session, as `<time>_<session>.jsonl`.
 - `bots/<id>/`: the folder of a bot with no `workspace`.
 - `mail/<session>/`: messages not read yet.

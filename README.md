@@ -26,16 +26,16 @@ botmode setup
 ## Use
 
 ```sh
-botmode                                   # the TUI, as the handler
-botmode -c                                # continue the last handler conversation in this folder
-botmode -p "make me a research bot"       # one message, no TUI
+botmode                                   # the TUI, as the handler, carrying on its last conversation in this folder
+botmode -r                                # pick another handler conversation to carry on
+botmode -p "make me a research bot"       # one message, no TUI, in that same conversation
 botmode status                            # sign-ins, model, bots, host and connected machines
 botmode teardown                          # undo everything setup did (asks before deleting your bots)
 botmode update                            # the latest version from GitHub, then a host restart
 npm test                                  # in a checkout; no model needed
 ```
 
-Any arguments other than the commands below go straight to pi. In the TUI:
+Any arguments other than the commands below go straight to pi. Your handler remembers your conversation when you quit: `botmode` carries on the last one you had in the folder you start it in, unless you name a session yourself (`-r`, `--session`, `--no-session`…). `/new` starts a fresh one, which `botmode` carries on from then. In the TUI:
 - `/sessions`, or ← on an empty prompt, is the lobby: every bot session on this machine with its folder, and the ones at work on your other machines. Pick an idle one to talk with that bot yourself, as in any pi session; pick `handler` to come back to your own conversation. Pick one at work on this machine to watch it: the window shows its conversation as it grows, what you type goes to the bot as a message that reaches it at its next step, and once it is done the session is yours to talk in. Pick it again in the lobby to stop it, if this window started it. One at work on another machine shows its steps, and takes a message or a stop the same way. `/sessions <id>` opens a session directly. While you are in a session, handoffs to it are refused, so the bot never works in two places at once.
   - Each session you open gets a **room**: the `botmode` command runs a pi of its own for it, in a terminal of its own, and shows you one room at a time, as tmux does. Leaving a room does not stop it. A room at work, your handler's included, carries on out of sight, shows as working in the lobby, and closes once it is done. An idle room closes as you leave it, since all it did is in its session.
   - Without rooms (pi started some other way, or node-pty missing), the window switches sessions in place. pi stops a session's work as the window switches away, so Botmode picks it back up in the background, redoing the step it was in.
@@ -47,6 +47,7 @@ Any arguments other than the commands below go straight to pi. In the TUI:
 
 Everything lives in `BOTMODE_HOME` (default `~/.botmode`):
 - `config.json`, which holds the team;
+- `handler/`, your handler's conversations with you, apart from those of the pi you run yourself;
 - `sessions/`, with one pi session per bot and per copy, and a `<session>.lock` file while one is at work or open in a window. For a bot in Claude Code, the file holds only its folder and the id of its Claude Code conversation, which Claude Code keeps with yours (`~/.claude/projects`);
 - `mail/`, the messages waiting for each session at work and for your handler;
 - `bots/<id>/`, a working folder for each bot that has no `workspace`;
@@ -177,6 +178,7 @@ handoff to mac/dev ──HTTPS on the tailnet, token──▶ Mac: botmode host 
 - ← opens the lobby only in pi's own prompt editor, and only when it is empty; a terminal that sends ← some other way keeps `/sessions`.
 - `/sessions` waits for your other machines' rosters, up to 3 seconds for one that is off.
 - pi offers skills only to a model with `read` or `bash`, so a handler configured without both configures from `configure`'s own description and its error messages alone.
+- Your handler carries on its conversation per folder, as pi keeps them, so `botmode` started in another folder starts another conversation there. Conversations from before Botmode kept them in `handler/` stay with pi's own, where plain `pi -r` finds them.
 - Changing a bot's `workspace` starts its own session afresh, because pi finds a session only from the folder it was started in. Its copies keep their folders.
 - Stopping a bot, with Esc or from `/sessions`, stops only that bot. Bots further down its chain, and processes their tools started, keep running until they finish.
 - A bot in Claude Code hears a message only after a step that uses a tool, or once it finishes. Claude Code offers the team's tools through its tool search, which takes the bot a step to find them.

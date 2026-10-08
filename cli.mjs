@@ -19,6 +19,10 @@ const DRAWING = fileURLToPath(new URL("botmode-tui.mjs", import.meta.url)); // L
 // The extensions of a pi in your window, and of your handler's, which alone asks you questions there.
 const LOADS = [EXTENSION, DRAWING, MCP_ADAPTER, BILLION_CONTEXT].flatMap((file) => ["-e", file]);
 const HANDLER_LOADS = [...LOADS, "-e", ASK_USER];
+// Your handler carries on its last conversation in the folder you start in, as pi's -c does, unless you name a session.
+// Its conversations stay apart from those of the pi you run yourself, in ~/.botmode/handler.
+const PICKS = ["-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork", "--no-session"];
+const handlerArgs = (args) => ["--session-dir", path.join(HOME, "handler"), ...(args.some((arg) => PICKS.includes(arg)) ? [] : ["--continue"]), ...args];
 // pi comes with this package. Its command is dist/bundle/cli.js, beside the dist/index.js the package exports.
 const PI = path.join(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
 process.env.BOTMODE_PI = PI;
@@ -653,7 +657,7 @@ async function openWindow(args) {
 
 const commands = { setup, invite, status, teardown, update, restart, host: (port) => serve(Number(port) || PORT), help: () => say(HELP) };
 const [command, ...rest] = process.argv.slice(2);
-if (!Object.hasOwn(commands, command)) await openWindow(process.argv.slice(2));
+if (!Object.hasOwn(commands, command)) await openWindow(handlerArgs(process.argv.slice(2)));
 else {
   try {
     await commands[command](...rest);
