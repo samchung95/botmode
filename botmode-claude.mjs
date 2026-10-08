@@ -1,6 +1,7 @@
 // How a bot in Claude Code works with the team; botmode.mjs starts Claude Code with it. `mcp <session>` serves the team's
 // handoff and message tools over stdio, `mail <session>` is the PostToolUse hook that hands the bot the messages that came
-// for it, and `status <session>` is its status line when you talk with it in a room of your window.
+// for it, and `status <session>` is its status line when you talk with it in a room of your window, where the `busy` and
+// `idle` hooks tell the window as its turns start and end.
 import readline from "node:readline";
 import { HANDOFF, MESSAGE, botOf, handOffAndWait, loadConfig, mailFor, sendMessage } from "./botmode.mjs";
 
@@ -16,8 +17,14 @@ if (mode === "mail") {
   for await (const _ of process.stdin); // What Claude Code says about the step, which the messages do not depend on.
   const text = mailFor(session);
   if (text) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: text } }));
+} else if (mode === "busy" || mode === "idle") {
+  for await (const _ of process.stdin);
+  // Only as you talk with it in a room of your window, which then knows whether ← may go back to the lobby.
+  if (process.env.BOTMODE_ROOM === session) {
+    await fetch(process.env.BOTMODE_ROOMS, { method: "POST", body: JSON.stringify({ room: session, busy: mode === "busy" }) }).catch(() => {});
+  }
 } else if (mode === "status") {
-  console.log(`${session} · /exit goes back to your handler`);
+  console.log(`${session} · ← on an empty prompt, the lobby · /exit, your handler`);
 } else if (mode === "mcp") {
   const calls = new Map(); // The id of each tool call under way -> what stops it.
   const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);

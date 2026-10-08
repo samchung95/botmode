@@ -10,8 +10,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { HANDLER, HOME, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, loadConfig, readInvite, release, remoteTeams, saveToken,
-  serve, setHost, token, working } from "./botmode.mjs";
+import { HANDLER, HOME, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, leavesClaude, loadConfig, readInvite, release, remoteTeams,
+  saveToken, serve, setHost, token, working } from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
 const EXTENSION = fileURLToPath(new URL("botmode.mjs", import.meta.url));
@@ -551,7 +551,8 @@ async function openWindow(args) {
       fs.chmodSync(path.join(path.dirname(createRequire(import.meta.url).resolve("node-pty")), "..", "prebuilds", `darwin-${process.arch}`, "spawn-helper"), 0o755);
     } catch {} // An install you cannot change: if node-pty then cannot start a terminal, you get one pi below.
   }
-  const rooms = new Map(); // name -> {term, busy}
+  const rooms = new Map(); // name -> {term, busy}, and for Claude Code what leavesClaude keeps
+  const piModes = new Set(); // Bracketed paste and modified keys, as pi set them, which Claude Code turns off as it leaves.
   let shown, started = 0, seen = 0; // Rooms started, and those that ended in sight.
   const secret = crypto.randomBytes(16).toString("hex");
   const server = http.createServer(async (req, res) => {
@@ -603,15 +604,23 @@ async function openWindow(args) {
       throw error;
     }
     started++;
-    rooms.set(name, { term, busy: false });
-    term.onData((data) => name === shown && process.stdout.write(data));
+    const room = { term, busy: false, claude, blank: true, line: "" };
+    rooms.set(name, room);
+    term.onData((data) => {
+      if (!claude) for (const mode of data.match(/\x1b\[(?:\?2004h|>4;2m)/g) ?? []) piModes.add(mode);
+      if (name === shown) process.stdout.write(data);
+    });
     term.onExit(({ exitCode }) => {
       if (claude) release(name);
       if (rooms.get(name)?.term !== term) return; // Closed by this process.
       rooms.delete(name);
       if (name === shown) seen++;
       if (name === HANDLER) quit(exitCode);
-      else if (name === shown) show(HANDLER);
+      else if (name === shown) {
+        show(HANDLER);
+        if (claude) process.stdout.write([...piModes].join(""));
+        if (room.lobby) rooms.get(HANDLER)?.term.write("\x1b[D"); // Your handler's ← opens the lobby.
+      }
     });
   }
   try {
@@ -624,7 +633,14 @@ async function openWindow(args) {
   process.stdin.setRawMode(true);
   process.stdin.setEncoding("utf8");
   // pi suspends itself on Ctrl+Z, which in a room would only freeze it, out of your shell's reach.
-  process.stdin.on("data", (data) => (data !== "\x1a" || process.platform === "win32") && rooms.get(shown)?.term.write(data));
+  process.stdin.on("data", (data) => {
+    const room = rooms.get(shown);
+    if (room?.claude && leavesClaude(room, data)) {
+      room.lobby = true;
+      return room.term.write("\x04\x04"); // Claude Code leaves as on Ctrl+D, and sets your terminal back as it goes.
+    }
+    if (data !== "\x1a" || process.platform === "win32") room?.term.write(data);
+  });
   if (process.platform === "win32") { // As pi does, so that keys such as Shift+Tab reach a room whole.
     const tui = await import(pathToFileURL(createRequire(PI).resolve("@earendil-works/pi-tui")).href).catch(() => undefined);
     tui?.getNativeClipboard()?.enableVirtualTerminalInput?.();

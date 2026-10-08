@@ -22,6 +22,8 @@ const TOKEN = path.join(HOME, "token"); // The secret all your machines share; a
 const SESSIONS = path.join(HOME, "sessions");
 const MAIL = path.join(HOME, "mail"); // One folder per session that reads messages; each message is a JSON file.
 const WINDOW = path.join(HOME, "window"); // The pid of the pi whose window has your handler's conversation open.
+// Profiles for bots in Claude Code, a folder each, with the skills, plugins and MCP servers they load (skills/claude-code-profiles).
+const PROFILES = path.join(HOME, "profiles");
 const ABOVE = (process.env.BOTMODE_CHAIN || "").split(",").filter(Boolean); // machine/bot entries waiting on this bot, outermost first.
 const SELF = fileURLToPath(import.meta.url);
 // pi's entry script. Inside pi it is process.argv[1]; the `botmode` command sets BOTMODE_PI after importing this file.
@@ -51,6 +53,7 @@ const BOT_FIELDS = {
   model: ["string", false], // provider/model[:thinking]; empty uses defaults.model, then pi's default. In Claude Code, its model.
   tools: ["list", false], // pi tool names; omitted keeps pi's defaults, [] leaves only the team tools.
   workspace: ["string", false], // An existing absolute folder; omitted gives the bot a folder of its own.
+  profile: ["string", false], // A bot in Claude Code: the folder in PROFILES it loads.
   archived: ["list", false], // Its sessions out of the lobby and away from handoffs; its own id archives the whole bot.
 };
 const AGENTS = ["pi", "claude"];
@@ -69,8 +72,9 @@ export const DEFAULT = {
     },
   },
 };
-// The handler's guide to configure: pi lists it by name and the handler reads it only when it changes the team.
-const SKILL = fileURLToPath(new URL("skills/configure-team", import.meta.url));
+// The handler's guides, to configure and to Claude Code profiles: pi lists them by name and the handler reads one only when
+// it needs it.
+const SKILLS = fileURLToPath(new URL("skills", import.meta.url));
 
 // pi loads this file afresh for every session it opens, so what must outlive one lives here: the bots this process runs
 // ({name, steps, stop}), the bot sessions open in this window, the owner's own session, and how to redraw the window's list.
@@ -308,6 +312,10 @@ export function problems(config) {
     if (typeof bot.agent === "string" && !AGENTS.includes(bot.agent)) found.push(`${where}.agent must be "pi" or "claude"`);
     if (bot.agent === "claude" && id === HANDLER) found.push(`${where}.agent: the handler works in pi`);
     if (bot.agent === "claude" && bot.tools !== undefined) found.push(`${where}.tools: a bot in Claude Code has Claude Code's tools`);
+    if (typeof bot.profile === "string" && bot.agent !== "claude") found.push(`${where}.profile: only a bot in Claude Code has a profile`);
+    else if (typeof bot.profile === "string" && !(BOT_ID.test(bot.profile) && isFolder(path.join(PROFILES, bot.profile)))) {
+      found.push(`${where}.profile must name a folder in ${PROFILES}`);
+    }
     if (bot.archived !== undefined && id === HANDLER) found.push(`${where}.archived: the handler cannot be archived`);
     else if (Array.isArray(bot.archived) && !bot.archived.every((session) => typeof session === "string" && SESSION_ID.test(session) && botOf(session) === id)) {
       found.push(`${where}.archived must list ${id} or its copies, such as ${id}.2`);
@@ -426,21 +434,56 @@ function newFile(session, fields) {
  * its bot with the team's prompt, and with handoff and message from botmode-claude.mjs, which also hands it its messages
  * after each step. ← on an empty prompt edits, as everywhere else, instead of opening Claude Code's agents, which would take
  * the conversation out of Botmode: the lobby is ours. Claude Code reads leftArrowOpensAgents only from the owner's own config.
- * The team's tools are its only MCP tools, and Claude Code's own messages to the owner's other Claude Code sessions are off.
+ * Claude Code's own messages to the owner's other Claude Code sessions are off. Its profile is a plugin, with more plugins in
+ * its plugins folder. --strict-mcp-config leaves out every MCP server not in --mcp-config, the owner's and the plugins' alike,
+ * so its MCP servers are the team's and those in its profile's .mcp.json, which comes first: a name's last config wins.
  */
 async function claudeArgs(config, session, chain) {
   const bot = config.bots[botOf(session)];
   const bridge = (mode) => `node "${BRIDGE.replaceAll("\\", "/")}" ${mode} ${session}`; // Claude Code runs these in a shell.
+  const hook = (mode) => [{ hooks: [{ type: "command", command: bridge(mode) }] }];
+  // Its turns in a room, which tell your window whether ← may go back to the lobby (see leavesClaude).
   const settings = { disableAgentView: true, statusLine: { type: "command", command: bridge("status") },
-    hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: bridge("mail") }] }] } };
+    hooks: { PostToolUse: [{ matcher: "*", ...hook("mail")[0] }], UserPromptSubmit: hook("busy"), Stop: hook("idle"), StopFailure: hook("idle") } };
   // All the bridge needs to work for this session on this machine, whatever Claude Code passes on of its own.
   const env = { BOTMODE_HOME: HOME, BOTMODE_MACHINE: MACHINE, BOTMODE_PI: piEntry(), BOTMODE_CHAIN: chain.join(","),
     ...(process.env.BOTMODE_CLAUDE && { BOTMODE_CLAUDE: process.env.BOTMODE_CLAUDE }) };
   const servers = { mcpServers: { botmode: { type: "stdio", command: process.execPath, args: [BRIDGE, "mcp", session], env } } };
   const team = `${teamPrompt(config, botOf(session), await remoteTeams(config), working())}\n\nhandoff and message are your ` +
     "mcp__botmode__handoff and mcp__botmode__message tools; they are your only way to the team.";
-  return ["--permission-mode", "bypassPermissions", "--settings", JSON.stringify(settings), "--mcp-config", JSON.stringify(servers),
-    "--strict-mcp-config", "--disallowedTools", "SendMessage,ListAgents", "--append-system-prompt", team, ...(bot.model ? ["--model", bot.model] : [])];
+  const profile = bot.profile ? [path.join(PROFILES, bot.profile)] : [];
+  const inProfile = (name) => profile.map((dir) => path.join(dir, name)).filter((file) => fs.existsSync(file));
+  return ["--permission-mode", "bypassPermissions", "--settings", JSON.stringify(settings),
+    "--mcp-config", ...inProfile(".mcp.json"), JSON.stringify(servers), "--strict-mcp-config",
+    ...[...profile, ...inProfile("plugins")].flatMap((dir) => ["--plugin-dir", dir]),
+    "--disallowedTools", "SendMessage,ListAgents", "--append-system-prompt", team, ...(bot.model ? ["--model", bot.model] : [])];
+}
+
+// Keys as Windows Terminal sends them to a console program, such as Claude Code: CSI Vk;Sc;Uc;Kd;Cs;Rc _, down and up.
+const WIN32_KEY = /\x1b\[(\d+);\d+;(\d+);(\d+);\d+;\d+_/g;
+const WIN32_VT = { 37: "\x1b[D", 38: "\x1b[A", 40: "\x1b[B" }; // ←, and ↑ and ↓, which bring back what you sent before.
+// What the terminal reports rather than what you type: the mouse, focus, its answers to queries, and keys let go or held.
+const REPORT = /^\x1b(?:\[(?:<[\d;]+[Mm]|[IO]|[?>][\d;:]*[A-Za-z]|\d+;\d+R|[\d;:]*:[23][A-Za-z~])|[\]P])/;
+
+/**
+ * Whether `data`, typed in a room of Claude Code, goes back to the lobby: ← on an empty prompt while Claude Code is idle,
+ * as in pi. Claude Code does not say what its prompt holds, so `room` keeps what your keys tell: {blank, line}, empty once
+ * you sent a message that opens no menu, and {busy}, which its hooks set.
+ */
+export function leavesClaude(room, data) {
+  const text = data.replace(WIN32_KEY, (_, vk, char, down) => down !== "1" ? "" : Number(char) ? String.fromCharCode(char) : WIN32_VT[vk] ?? "");
+  for (const key of text.match(/\x1b\[[\d;:?<>]*[ -/]*[@-~]|\x1bO.|\x1b[\]P][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[^[\]OP]?|[\s\S]/g) ?? []) {
+    if (["\x1b[D", "\x1bOD"].includes(key)) {
+      if (room.blank && !room.busy) return true;
+    } else if (["\x1b", "\x1b[27u", "\x03", "\x1b[99;5u"].includes(key)) {
+      room.busy = false; // Esc or Ctrl+C stops its turn, after which Claude Code runs no Stop hook.
+    } else if (!REPORT.test(key)) {
+      const sent = ["\r", "\x1b[13u"].includes(key);
+      room.blank = sent && !/^\/|\\$/.test(room.line); // A command may show a menu, and \ before Enter starts a new line.
+      room.line = sent ? "" : room.line + key;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1102,7 +1145,7 @@ export default function botmode(pi) {
 
   pi.registerMessageRenderer("botmode", (message, _options, theme) => messageView(message, theme));
 
-  pi.on("resources_discover", (_event, ctx) => whoAmI(ctx).bot === HANDLER ? { skillPaths: [SKILL] } : undefined);
+  pi.on("resources_discover", (_event, ctx) => whoAmI(ctx).bot === HANDLER ? { skillPaths: [SKILLS] } : undefined);
 
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
@@ -1163,7 +1206,7 @@ export default function botmode(pi) {
     description: "Change the team's configuration with a JSON merge patch: objects merge, null deletes a key, other values " +
       "replace. Creates, edits, archives and removes bots and sets defaults; the configure-team skill has the fields. The " +
       "whole patch applies, or nothing does and the result lists every problem. The empty patch {} changes nothing and " +
-      "shows the configuration and the bot sessions on this machine.",
+      "shows the configuration, and the bot sessions and Claude Code profiles on this machine.",
     promptSnippet: "Create, edit, archive or remove team bots with a JSON merge patch",
     parameters: { type: "object", additionalProperties: false, required: ["patch"], properties: {
       patch: { type: "object", description: 'For example {"bots": {"research": {"name": "Researcher", "description": "Finds and summarizes sources"}}}' },
@@ -1173,7 +1216,10 @@ export default function botmode(pi) {
       if (isObject(params.patch) && !Object.keys(params.patch).length) {
         const config = loadConfig();
         const sessions = [...sessionFiles().keys()].filter((session) => inLobby(config, session));
-        return result(`The configuration is:\n${JSON.stringify(config, null, 2)}\n\nBot sessions on this machine: ${sessions.join(", ") || "none yet"}`);
+        const profiles = fs.existsSync(PROFILES)
+          ? fs.readdirSync(PROFILES).filter((name) => BOT_ID.test(name) && isFolder(path.join(PROFILES, name))).sort() : [];
+        return result(`The configuration is:\n${JSON.stringify(config, null, 2)}\n\nBot sessions on this machine: ${sessions.join(", ") || "none yet"}\n` +
+          `Claude Code profiles on this machine, in ${PROFILES}: ${profiles.join(", ") || "none yet"}`);
       }
       const found = applyPatch(params.patch);
       if (found.length) return result(`Not applied; the configuration is unchanged:\n${found.join("\n")}`);
@@ -1211,7 +1257,7 @@ export default function botmode(pi) {
 
   /**
    * A bot in Claude Code: one at work you watch, and with any other you talk in Claude Code, in a room of its own, which the
-   * rooms keep as yours while it is open. Leaving it, with /exit, brings you back to your handler.
+   * rooms keep as yours while it is open. Leaving it brings you back to your handler: with ←, to its lobby, or with /exit.
    */
   async function talkInClaude(ctx, config, session, file) {
     const task = holder(session)?.task;

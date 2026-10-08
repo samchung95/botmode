@@ -11,7 +11,11 @@ const args = process.argv.slice(2);
 const flag = (name) => args.includes(name) ? args[args.indexOf(name) + 1] : undefined;
 const prompt = args.at(-1);
 const settings = JSON.parse(flag("--settings"));
-const server = JSON.parse(flag("--mcp-config")).mcpServers.botmode;
+const from = args.indexOf("--mcp-config") + 1; // Every config up to the next flag; a name's last config wins.
+const configs = args.slice(from, args.findIndex((arg, n) => n >= from && arg.startsWith("--")));
+const server = JSON.parse(configs.at(-1)).mcpServers.botmode;
+const loaded = [...args.flatMap((arg, n) => arg === "--plugin-dir" ? [args[n + 1]] : []), ...configs.slice(0, -1)]
+  .map((file) => path.relative(process.env.BOTMODE_HOME, file).replaceAll("\\", "/")); // Its profile.
 const session = server.args.at(-1); // The botmode session it works for.
 const dir = path.join(process.env.BOTMODE_HOME, "claude");
 const fileOf = (id) => path.join(dir, `${id}.jsonl`);
@@ -62,7 +66,7 @@ const output = used ? await step(`mcp__botmode__${used[1]}`, JSON.parse(used[2])
 if (prompt.includes("slow")) await step("Bash", { command: "sleep 2" }, () => new Promise((resolve) => setTimeout(resolve, 2000)));
 // As in Claude Code, which reads leftArrowOpensAgents only from the owner's own config, where it is on unless they turned it off.
 const how = prompt.includes("how") ? ` · ${flag("--model") ?? "default model"}, ${flag("--permission-mode")}, ← ${settings.disableAgentView ? "edits" : "opens agents"}, ` +
-  `as "${flag("--append-system-prompt").split("\n")[0]}"` : "";
+  `as "${flag("--append-system-prompt").split("\n")[0]}"${loaded.length ? `, loading ${loaded.join(", ")}` : ""}` : "";
 const text = `${session} heard: ${lines(id).slice(1).map((line) => line.text).join(" | ")}${how}${output && ` · ${output}`}`;
 emit({ type: "assistant", message: { content: [{ type: "text", text }] } });
 emit({ type: "result", subtype: "success", is_error: false, result: text });

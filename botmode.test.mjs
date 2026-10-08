@@ -11,8 +11,8 @@ process.env.BOTMODE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "botmode-"));
 process.env.BOTMODE_MACHINE = "pc";
 process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs,
 process.env.BOTMODE_CLAUDE = fileURLToPath(new URL("fake-claude.mjs", import.meta.url)); // and Claude Code bots as fake-claude.mjs.
-const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, loadConfig, mergePatch, problems, readInvite,
-  refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
+const { default: botmode, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, leavesClaude, loadConfig, mergePatch, problems,
+  readInvite, refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
 
 /**
  * Loads the extension the way pi does: in the owner's window (no session), or in a bot's session such as "research.2",
@@ -172,6 +172,32 @@ test("← on an empty prompt opens /sessions; while you type, or in a menu, it s
   } finally {
     handler.close();
   }
+});
+
+test("in a room of Claude Code, ← goes back to the lobby only on an empty prompt while it is idle, as your keys tell", () => {
+  const room = { blank: true, line: "", busy: false };
+  const keys = (...pressed) => pressed.map((key) => leavesClaude(room, key));
+  assert.deepEqual(keys("\x1b[D"), [true]); // Just opened.
+  assert.deepEqual(keys("h", "i", "\x1b[D", "\x1b[1;1:3D", "\x1b[D"), [false, false, false, false, false]); // ← moves the cursor; a release is no key.
+  assert.deepEqual(keys("\r", "\x1b[D"), [false, true]); // Sent.
+  room.busy = true; // Its UserPromptSubmit hook.
+  assert.deepEqual(keys("\x1b[D"), [false]); // At work, or asking you something.
+  room.busy = false; // Its Stop hook.
+  assert.deepEqual(keys("/", "m", "o", "d", "e", "l", "\r", "\x1b[D"), [false, false, false, false, false, false, false, false]); // It may show a menu.
+  assert.deepEqual(keys("x", "\\", "\r", "\x1b[D"), [false, false, false, false]); // \ and Enter start a new line.
+  assert.deepEqual(keys("o", "k", "\r", "\x1b[D"), [false, false, false, true]);
+  room.busy = true;
+  assert.deepEqual(keys("\x1b", "\x1b[D"), [false, true]); // Esc stops its turn, after which Claude Code runs no Stop hook.
+  // What the terminal reports is no key: focus, the mouse, and answers to Claude Code's questions about it.
+  assert.deepEqual(keys("\x1b[I", "\x1b[<35;10;5M", "\x1b[?62;22c", "\x1b]11;rgb:0c0c/0c0c/0c0c\x07", "\x1b[D"), [false, false, false, false, true]);
+  // Windows Terminal sends a console program each key down and up, as CSI Vk;Sc;Uc;Kd;Cs;Rc _.
+  const win = { blank: true, line: "", busy: false };
+  const left = "\x1b[37;75;0;1;0;1_\x1b[37;75;0;0;0;1_";
+  assert.equal(leavesClaude(win, "\x1b[72;35;104;1;0;1_\x1b[72;35;104;0;0;1_"), false); // h
+  assert.equal(leavesClaude(win, left), false);
+  assert.equal(leavesClaude(win, "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_"), false); // Enter
+  assert.equal(leavesClaude(win, "\x1b[16;42;0;1;16;1_"), false); // Shift, which types nothing.
+  assert.equal(leavesClaude(win, left), true);
 });
 
 test("/sessions enters a bot's session as that bot, and the overview goes back to the handler", async () => {
@@ -494,6 +520,30 @@ test("a bot with agent claude works in Claude Code, with no permission prompts, 
   }
 });
 
+test("a bot in Claude Code loads the profile the handler gives it: its skills, plugins and MCP servers", async () => {
+  const web = path.join(HOME, "profiles", "web");
+  fs.mkdirSync(path.join(web, "plugins"), { recursive: true });
+  fs.writeFileSync(path.join(web, ".mcp.json"), '{"mcpServers": {}}');
+  fs.mkdirSync(path.join(HOME, "profiles", "plain"));
+  for (const [patch, problem] of [
+    [{ bots: { a: { name: "A", description: "a", profile: "web" } } }, /bots.a.profile: only a bot in Claude Code has a profile/],
+    [{ bots: { a: { name: "A", description: "a", agent: "claude", profile: "none" } } }, /bots.a.profile must name a folder in .*profiles/],
+    [{ bots: { a: { name: "A", description: "a", agent: "claude", profile: "../web" } } }, /bots.a.profile must name a folder in .*profiles/],
+  ]) assert.match(applyPatch(patch).join("\n"), problem);
+  assert.deepEqual(applyPatch({ bots: { webdev: { name: "Webdev", description: "Builds sites", agent: "claude", profile: "web" },
+    tidy: { name: "Tidy", description: "Tidies code", agent: "claude", profile: "plain" } } }), []);
+  const handler = await open();
+  try {
+    assert.match(await handler.call("configure", { patch: {} }), /^Claude Code profiles on this machine, in .+profiles: plain, web$/m);
+    assert.match(await handler.call("handoff", { bot: "webdev", session: "continue", task: "how do you run" }),
+      /as "You are Webdev. Builds sites", loading profiles\/web, profiles\/web\/plugins, profiles\/web\/.mcp.json$/);
+    assert.match(await handler.call("handoff", { bot: "tidy", session: "continue", task: "how do you run" }), /, loading profiles\/plain$/); // Only what it has.
+  } finally {
+    handler.close();
+    applyPatch({ bots: { webdev: null, tidy: null } });
+  }
+});
+
 test("a bot in Claude Code hears messages after each step, and hands work to the team and messages it with the team's tools", async () => {
   const handler = await open();
   const a = await open("a"); // a's own pi, at work.
@@ -613,7 +663,7 @@ test("archiving a session at work stops it, and no one can message it", async ()
   }
 });
 
-test("the handler changes the team with the configure-team skill, which it loads only when it needs it", async () => {
+test("the handler changes the team, and sets up Claude Code profiles, with skills it loads only when it needs them", async () => {
   // Its prompt names the skill instead of carrying the configuration and its fields every turn.
   assert.match(teamPrompt(loadConfig(), "handler"), /load the configure-team skill/);
   assert.doesNotMatch(teamPrompt(loadConfig(), "handler"), /"bots":|workspace/);
@@ -621,15 +671,17 @@ test("the handler changes the team with the configure-team skill, which it loads
   let research;
   try {
     research = await open("research");
-    const [skill, ...more] = await handler.skills();
+    const [skills, ...more] = await handler.skills();
     assert.equal(more.length, 0);
     assert.deepEqual(await research.skills(), []); // Only the handler configures.
-    const guide = fs.readFileSync(path.join(skill, "SKILL.md"), "utf-8");
+    const guide = fs.readFileSync(path.join(skills, "configure-team", "SKILL.md"), "utf-8");
     assert.match(guide, /^---\nname: configure-team\ndescription: .+\n---\n/);
+    const profiles = fs.readFileSync(path.join(skills, "claude-code-profiles", "SKILL.md"), "utf-8");
+    assert.match(profiles, /^---\nname: claude-code-profiles\ndescription: .+\n---\n/);
     // Every field configure takes is in the guide.
     const fields = applyPatch({ bots: { handler: { nope: 1 } } }).join().match(/allowed: ([^)]*)/)[1].split(", ");
     for (const field of ["defaults", "hosts", ...fields]) assert.match(guide, new RegExp(`\`${field}`), field);
-    // An empty patch changes nothing and shows the configuration and the bot sessions here.
+    // An empty patch changes nothing and shows the configuration, and the bot sessions and profiles here.
     const shown = await handler.call("configure", { patch: {} });
     assert.match(shown, /^The configuration is:\n\{\n {2}"defaults"/);
     assert.match(shown, /^Bot sessions on this machine: (.+, )?research(, .+)?$/m);

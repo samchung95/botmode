@@ -33,13 +33,14 @@ Look before you change: `configure` with the empty patch `{}` changes nothing an
 - `tools`: pi tool names, from `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `powershell` on Windows. Omitted keeps pi's defaults (`read`, `bash`, `edit`, `write`); `[]` leaves only the team's tools, which every bot has.
 - `workspace`: an existing absolute folder the bot works in. Omitted, it gets a folder of its own.
 - `agent`: `"claude"` for a bot that works in Claude Code; omitted, or `"pi"`, for one in pi.
+- `profile`: for a bot in Claude Code, the profile it loads, with skills, plugins and MCP servers. The claude-code-profiles skill sets them up.
 - `archived`: the bot's archived sessions, below.
 
 Unknown fields are refused, so a typo fails loudly.
 
 ## Coding bots in Claude Code
 
-A bot for coding work can work in Claude Code instead of pi: give it `"agent": "claude"`. Botmode brings its own Claude Code, which `botmode setup` signs in, so the bot runs on this machine like any other; there is no `claude` to look for. It has all of Claude Code's tools and no permission prompts, so it has no `tools` field. You hand it work and message it as you would any bot. Leave its `workspace` out, or give it a project folder, never the owner's home folder: when the owner talks with the bot, Claude Code asks them to trust its folder, once for most folders but every time for the home folder.
+A bot for coding work can work in Claude Code instead of pi: give it `"agent": "claude"`. Botmode brings its own Claude Code, which `botmode setup` signs in, so the bot runs on this machine like any other; there is no `claude` to look for. It has all of Claude Code's tools and no permission prompts, so it has no `tools` field. For skills, plugins or MCP servers, give it a `profile`: load the claude-code-profiles skill. You hand it work and message it as you would any bot. Leave its `workspace` out, or give it a project folder, never the owner's home folder: when the owner talks with the bot, Claude Code asks them to trust its folder, once for most folders but every time for the home folder.
 
 ```json
 {"bots": {"coder": {"name": "Coder", "description": "Writes, fixes and reviews code in the owner's repositories", "agent": "claude", "model": "opus"}}}
