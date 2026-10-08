@@ -1,11 +1,18 @@
 // Stands in for pi in Botmode's tests: one `--mode json -p` run that keeps its session file the way pi does.
 // It replies "<session id> heard: <every prompt in the session>", adds " in <its folder>" when the prompt says "where", and
 // " with <its extensions>" when it says "extensions", and first waits a while when the prompt says "slow", or FAKE_PI_SLOW is set.
+// With --no-session it keeps nothing and replies "<model> named it: <the prompt's last line>".
 import fs from "node:fs";
 import path from "node:path";
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(name) ? args[args.indexOf(name) + 1] : undefined;
+for await (const _ of process.stdin); // As pi -p does, it reads what is piped in first, until it ends.
+const reply = (text) => console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } }));
+if (args.includes("--no-session")) {
+  reply(`${flag("--model")} named it: ${args.at(-1).split("\n").at(-1)}`);
+  process.exit();
+}
 const [dir, id, fork, prompt] = [flag("--session-dir"), flag("--session-id"), flag("--fork"), args.at(-1)];
 const lines = (file) => fs.readFileSync(file, "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 // Like pi with --session-dir, it finds a session only from the folder the session was started in.
@@ -23,4 +30,4 @@ const extensions = args.flatMap((arg, n) => arg === "-e" ? [path.relative(import
 const text = `${id ?? path.basename(file, ".jsonl")} heard: ${heard.join(" | ")}${prompt.includes("where") ? ` in ${process.cwd()}` : ""}` +
   `${prompt.includes("extensions") ? ` with ${extensions.join(", ")}` : ""}`;
 say("assistant", text);
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } }));
+reply(text);

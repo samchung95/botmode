@@ -3,7 +3,7 @@
 // says which bot this is; any other session is yours, and there this file is the handler. A handoff runs the target bot as
 // a child pi in its own ongoing session. `botmode host` (cli.mjs) serves this machine's bots to your other machines, where
 // they join the team as host/bot.
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
@@ -22,6 +22,8 @@ export const MACHINE = (process.env.BOTMODE_MACHINE || os.hostname()).toLowerCas
 const CONFIG = path.join(HOME, "config.json");
 const TOKEN = path.join(HOME, "token"); // The secret all your machines share; a host runs bots only for requests that carry it.
 const SESSIONS = path.join(HOME, "sessions");
+// Your handler's conversations with you, from every folder. Each has an address, handler.1, handler.2…, as a bot's copies do.
+const CONVERSATIONS = path.join(HOME, "handler");
 const MAIL = path.join(HOME, "mail"); // One folder per session that reads messages; each message is a JSON file.
 const WINDOW = path.join(HOME, "window"); // The pid of the pi whose window has your handler's conversation open.
 // Profiles for bots in Claude Code, a folder each, with the skills, plugins and MCP servers they load (skills/claude-code-profiles).
@@ -97,8 +99,9 @@ export const DEFAULT = {
 const SKILLS = fileURLToPath(new URL("skills", import.meta.url));
 
 // pi loads this file afresh for every session it opens, so what must outlive one lives here: the bots this process runs
-// ({name, steps, stop}), the bot sessions open in this window, the owner's own session, and how to redraw the window's list.
-const shared = globalThis[Symbol.for("botmode")] ??= { running: new Set(), entered: new Set(), home: undefined, render: undefined };
+// ({name, steps, stop}), the bot sessions open in this window, the owner's own session, how to redraw the window's list, and
+// the conversations with the handler the helper model has named, or is naming.
+const shared = globalThis[Symbol.for("botmode")] ??= { running: new Set(), entered: new Set(), home: undefined, render: undefined, named: new Set() };
 if (!shared.exitHook) {
   shared.exitHook = true;
   process.once("exit", () => shared.running.forEach((run) => run.stop())); // Bots never outlive the pi that started them.
@@ -165,6 +168,7 @@ function address(target) {
 }
 
 export const botOf = (session) => session.replace(/\.\d+$/, "");
+const isHandler = (address) => botOf(address) === HANDLER; // handler, or one of its conversations, such as handler.2.
 const lockOf = (session) => path.join(SESSIONS, `${session}.lock`);
 
 /** The {pid, task} of the live process running `session`, if one is. */
@@ -211,15 +215,34 @@ function windowOpen() {
   }
 }
 
+const idOf = (name) => name.slice(name.indexOf("_") + 1, -".jsonl".length); // pi names a session's file <time>_<session id>.jsonl.
+const filesIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith(".jsonl")) : [];
+
 /** Each bot session on this machine and its newest file, newest first. */
 function sessionFiles() {
-  const names = fs.existsSync(SESSIONS) ? fs.readdirSync(SESSIONS).filter((name) => name.endsWith(".jsonl")).sort().reverse() : [];
   const files = new Map();
-  for (const name of names) {
-    const session = name.slice(name.indexOf("_") + 1, -".jsonl".length); // pi names them <time>_<session id>.jsonl.
-    if (!files.has(session)) files.set(session, path.join(SESSIONS, name));
-  }
+  for (const name of filesIn(SESSIONS).sort().reverse()) if (!files.has(idOf(name))) files.set(idOf(name), path.join(SESSIONS, name));
   return files;
+}
+
+/**
+ * Starts a conversation of your handler's in `cwd`, at an address no session here has had, and returns its file. pi opens
+ * it as it opens any other, with its first line.
+ */
+export function newConversation(cwd) {
+  const taken = new Set([...filesIn(CONVERSATIONS).map(idOf), ...sessionFiles().keys()]);
+  fs.mkdirSync(MAIL, { recursive: true });
+  for (let n = 1; ; n++) {
+    const id = `${HANDLER}.${n}`;
+    if (taken.has(id)) continue;
+    try {
+      fs.mkdirSync(path.join(MAIL, id)); // Its mailbox, made here, claims the address: two windows never take the same one.
+    } catch (error) {
+      if (error.code === "EEXIST") continue;
+      throw error;
+    }
+    return newFile(id, { version: 3, id, timestamp: new Date().toISOString(), cwd }, CONVERSATIONS);
+  }
 }
 
 /** The sessions at work on this machine now: [{id, task}]. */
@@ -231,20 +254,23 @@ export function working() {
   });
 }
 
-/** Why a message from `from` cannot reach `to` on this machine, or "". The handler's mailbox waits for its window. */
+/**
+ * Why a message from `from` cannot reach `to` on this machine, or "". The mailboxes of your handler, and of each of its
+ * conversations, wait for your window.
+ */
 function undeliverable(config, to, from, text) {
   if (typeof text !== "string" || !text.trim()) return "Refused: the message is empty.";
   if (to === from) return "Refused: that is you.";
   if (archived(config, to)) return `Refused: ${to} is archived.`;
-  if (to === HANDLER || (SESSION_ID.test(to) && holder(to))) return "";
+  if (to === HANDLER || filesIn(CONVERSATIONS).map(idOf).includes(to) || (SESSION_ID.test(to) && holder(to))) return "";
   return `${to} is not working right now, so it reads no messages; hand it a task instead. Working now: ` +
     `${working().map((session) => session.id).join(", ") || "none"}.`;
 }
 
-/** Claims the first copy of `bot` that has never run. */
+/** Claims the first copy of `bot` that has never run, and never takes the address of one of your handler's conversations. */
 function claimCopy(bot, task) {
-  const files = sessionFiles();
-  for (let n = 2; ; n++) if (!files.has(`${bot}.${n}`) && claim(`${bot}.${n}`, task)) return `${bot}.${n}`;
+  const taken = new Set([...sessionFiles().keys(), ...filesIn(CONVERSATIONS).map(idOf)]);
+  for (let n = 2; ; n++) if (!taken.has(`${bot}.${n}`) && claim(`${bot}.${n}`, task)) return `${bot}.${n}`;
 }
 
 /**
@@ -257,20 +283,61 @@ function folderOf(config, session, file = sessionFiles().get(session)) {
   return session === bot || !file ? own : startedIn(file) ?? own;
 }
 
-/**
- * The first line of a session's file: pi's header, with the folder it started in. A bot in Claude Code has a file that
- * holds only this line, with its conversation's id in Claude Code as `claude`.
- */
-function header(file) {
-  const head = Buffer.alloc(64 * 1024);
-  const fd = fs.openSync(file, "r");
+/** The entries in the first 64 KB of a session's file, which pi's header starts; none for a file pi has not written yet. */
+function head(file) {
+  const buffer = Buffer.alloc(64 * 1024);
+  let fd;
   try {
-    return JSON.parse(head.toString("utf-8", 0, fs.readSync(fd, head)).split("\n", 1)[0]) ?? {};
+    fd = fs.openSync(file, "r");
   } catch {
-    return {};
+    return [];
+  }
+  try {
+    return buffer.toString("utf-8", 0, fs.readSync(fd, buffer)).split("\n").flatMap((line) => {
+      try {
+        const entry = JSON.parse(line);
+        return isObject(entry) ? [entry] : [];
+      } catch {
+        return []; // The last line, cut short.
+      }
+    });
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/**
+ * pi's header of a session's file, with the folder it started in. A bot in Claude Code has a file that holds only this
+ * line, with its conversation's id in Claude Code as `claude`.
+ */
+const header = (file) => head(file).find((entry) => entry.type === "session") ?? {};
+
+/**
+ * A conversation of your handler's as {file, id, cwd, title}: its name, from pi's /name or the helper model, or else its
+ * first message, and "" while it has neither.
+ * ponytail: reads the first 64 KB, so a conversation renamed after that keeps its first name; read the end too if that bites.
+ */
+function about(file) {
+  const entries = head(file);
+  const { id, cwd } = entries.find((entry) => entry.type === "session") ?? {};
+  const named = entries.filter((entry) => entry.type === "session_info" && entry.name).at(-1)?.name;
+  const first = entries.find((entry) => entry.type === "message" && entry.message?.role === "user");
+  return { file, id: id ?? HANDLER, cwd, title: named || (first ? oneLine(textOf(first.message.content), 60) : "") };
+}
+
+/** Your handler's conversations, the newest `count` of them, newest first (see about). */
+function conversations(count = Infinity) {
+  return filesIn(CONVERSATIONS).map((name) => path.join(CONVERSATIONS, name)).map((file) => ({ file, at: fs.statSync(file).mtimeMs }))
+    .sort((a, b) => b.at - a.at).slice(0, count).map(({ file }) => about(file));
+}
+
+/**
+ * The file of your handler's newest conversation in the folder `cwd`, as pi's -c finds it. One not yet talked in, as /task
+ * leaves with nothing typed, counts only when there is no other, and a new one is started only when there is none.
+ */
+export function conversationIn(cwd) {
+  const here = conversations().filter((talk) => talk.cwd && !path.relative(talk.cwd, cwd));
+  return (here.find((talk) => talk.title) ?? here[0])?.file ?? newConversation(cwd);
 }
 
 /** The folder a session started in. */
@@ -296,8 +363,8 @@ export function problems(config) {
   const found = Object.keys(config).filter((key) => !SECTIONS.includes(key))
     .map((key) => `${key} is not a configuration section (allowed: ${SECTIONS.join(", ")})`);
   const defaults = config.defaults ?? {};
-  if (!isObject(defaults) || Object.keys(defaults).some((key) => key !== "model") || typeof (defaults.model ?? "") !== "string") {
-    found.push('defaults must be {"model": "provider/model"}');
+  if (!isObject(defaults) || Object.entries(defaults).some(([key, value]) => !["model", "helperModel"].includes(key) || typeof value !== "string")) {
+    found.push('defaults must be {"model": "provider/model", "helperModel": "provider/model"}');
   }
   const hosts = config.hosts ?? {};
   if (!isObject(hosts)) found.push('hosts must be {"<id>": {"url": "https://..."}}');
@@ -375,8 +442,8 @@ export function applyPatch(patch) {
 /** Whether `session` is archived, alone or with its whole bot. */
 const archived = (config, session) => (config.bots[botOf(session)]?.archived ?? []).some((entry) => entry === session || entry === botOf(session));
 
-/** Whether the lobby lists `session`: one of your bots', and not archived. */
-const inLobby = (config, session) => session !== HANDLER && Object.hasOwn(config.bots, botOf(session)) && !archived(config, session);
+/** Whether the lobby lists `session` among the bots': one of your bots', and not archived. */
+const inLobby = (config, session) => !isHandler(session) && Object.hasOwn(config.bots, botOf(session)) && !archived(config, session);
 
 /** Why `chain` may not hand `task` to `target`, or "" when it may. A host checks again against its own team. */
 export function refusal(config, chain, target, task) {
@@ -446,10 +513,12 @@ const oneLine = (text, size = 100) => {
 const textOf = (content) => typeof content === "string" ? content
   : (content ?? []).filter((block) => block?.type === "text").map((block) => block.text ?? "").join("");
 
-/** Starts a session's file as pi names them, <time>_<session>.jsonl, with `fields` in its first line. */
-function newFile(session, fields) {
-  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}_${session}.jsonl`;
-  fs.writeFileSync(path.join(SESSIONS, name), `${JSON.stringify({ type: "session", ...fields })}\n`);
+/** Starts a session's file in `dir` as pi names them, <time>_<session>.jsonl, with `fields` in its first line; returns it. */
+function newFile(session, fields, dir = SESSIONS) {
+  const file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${session}.jsonl`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ type: "session", ...fields })}\n`);
+  return file;
 }
 
 let starting; // A proxy claudeProxy is starting, which the bots that ask meanwhile wait for.
@@ -593,6 +662,24 @@ async function runBot(config, target, how, prompt, chain, signal, onProgress) {
     release(session);
   }
 }
+
+/** A title of a few words for a task, from the helper model `spec` in a bare pi of its own; "" if it gives none within a minute. */
+const titleOf = (spec, task) => new Promise((resolve) => {
+  const { provider, id, thinking } = parseModel(spec);
+  const prompt = `Give this task a title of a few words, with no quotes or full stop. Reply with the title alone.\nThe task:\n${task}`;
+  execFile(process.execPath, [piEntry(), "--mode", "json", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
+    "--no-prompt-templates", "--no-context-files", "--model", `${provider}/${id}`, "--thinking", thinking ?? "off", prompt],
+  { timeout: 60_000, windowsHide: true, maxBuffer: 4e6 }, (_error, stdout) => {
+    const reply = String(stdout).split("\n").flatMap((line) => {
+      try {
+        return [JSON.parse(line)];
+      } catch {
+        return [];
+      }
+    }).filter((event) => event.type === "message_end" && event.message?.role === "assistant").at(-1);
+    resolve(oneLine(textOf(reply?.message.content).replace(/^["'\s]+|["'.\s]+$/g, ""), 60));
+  }).stdin.end(); // pi -p reads what is piped in until it ends.
+});
 
 /**
  * Works in a session through child pis, or Claude Codes: a turn on `prompt`, then a turn on any messages that came for
@@ -874,7 +961,7 @@ async function answer(req, res, secret, log) {
     }
     // As with handoffs, only another machine's handler reaches this machine's handler; so does a bot doing a task from it.
     const asked = Array.isArray(chain) && chain.at(-1) === `${MACHINE}/${HANDLER}`;
-    const refused = to === HANDLER && !from.endsWith(`/${HANDLER}`) && !asked
+    const refused = isHandler(to) && !isHandler(from.slice(from.indexOf("/") + 1)) && !asked
       ? `Refused: ${MACHINE}'s handler hears only from your handler, and from bots at work on a task it handed them.`
       : undeliverable(config, to, from, text);
     if (!refused) post(to, { from, text });
@@ -1049,15 +1136,17 @@ export const MESSAGE = {
 
 /**
  * Who this pi is. In a bot's session under ~/.botmode/sessions it is that bot (research.2 is a copy of research); in any
- * other session it is the owner's handler. `box` is the mailbox it reads. The handler's sessions there are other machines'
- * handlers talking with this one, and leave the owner's mailbox to the owner's window.
+ * other session it is the owner's handler. `box` is the mailbox it reads: a conversation of your handler's reads the one
+ * of its address, such as handler.2, and one from before they had addresses reads handler's. The handler's sessions
+ * under ~/.botmode/sessions are other machines' handlers talking with this one, and leave the owner's mail to the window.
  */
 function whoAmI(ctx) {
   const manager = ctx.sessionManager;
   const id = manager.getSessionId();
   const ours = !path.relative(SESSIONS, manager.getSessionDir()) && SESSION_ID.test(id) && Object.hasOwn(loadConfig().bots, botOf(id));
   const session = ours ? id : undefined;
-  return { session, bot: session ? botOf(session) : HANDLER, box: session === HANDLER ? undefined : session ?? HANDLER };
+  return { session, bot: session ? botOf(session) : HANDLER,
+    box: session === HANDLER ? undefined : session ?? (SESSION_ID.test(id) && isHandler(id) ? id : HANDLER) };
 }
 
 function ago(file) {
@@ -1070,20 +1159,23 @@ const replyText = (target, outcome) => `${outcome.session ?? target} ${outcome.o
 
 const WAIT = 10 * 60_000; // How long message waits for an answer before the answer comes as an ordinary message.
 
+// How many of your handler's conversations the lobby lists, newest first: pi's menu does not scroll. `botmode -r` has the rest.
+const LOBBY = 20;
+
 // What a session hears when you leave it at work: pi stops a session's work as the window switches away from it.
 const CARRY_ON = "Carry on where you stopped: the owner stepped out of this session, which interrupted you, so redo a step that did not finish.";
 
 /** Carries on, in the background, with the work of a session this window has just left. */
-function carryOn({ session, file }) {
+function carryOn({ session, box, file }) {
   if (session) return runBot(loadConfig(), session, { session: "continue" }, CARRY_ON, [], undefined, () => {});
-  // Your handler's own conversation, which no lock guards: the window knows it is at work by this run.
-  work({ name: HANDLER, file, args: ["--session", file], cwd: startedIn(file) ?? process.cwd(), chain: [], onProgress: () => {} }, CARRY_ON);
+  // A conversation of your handler's, which no lock guards: the window knows it is at work by this run.
+  work({ name: box, file, args: ["--session", file], cwd: startedIn(file) ?? process.cwd(), chain: [], onProgress: () => {} }, CARRY_ON);
 }
 
-/** Sends what you type to `to`: a session at work, or your handler's conversation, at work without you. */
+/** Sends what you type to `to`: a session at work, or a conversation of your handler's, at work without you. */
 function tell(to, text) {
-  if (to !== HANDLER) return deliver(loadConfig(), to, HANDLER, text);
-  post(HANDLER, { text, reply: true }); // Your words as they are, at its next step.
+  if (!isHandler(to)) return deliver(loadConfig(), to, HANDLER, text);
+  post(to, { text, reply: true }); // Your words as they are, at its next step.
   return { ok: true, text: "Sent to your handler." };
 }
 
@@ -1116,6 +1208,11 @@ export default function botmode(pi) {
   const toRooms = (message) => fetch(rooms, { method: "POST", body: JSON.stringify({ room, ...message }) }).then(() => {}, () => {});
   // Replying, waiting on a bot it handed work to, or about to read a message: a room that is busy is kept out of sight.
   const busy = (ctx, box) => !ctx.isIdle() || shared.running.size > 0 || Boolean(box && letters(box).length);
+  // Your window's first room, or a window without rooms: it has the WINDOW file, and takes the messages for handler, such
+  // as your other machines' handlers', while your other conversations with your handler take only their own.
+  // ponytail: a conversation from before handler.N addresses has the box handler too, so with it open in a room of its own,
+  // it and your first room race for that mail; give such conversations an address if that bites.
+  const main = (ctx) => ctx.hasUI && !whoAmI(ctx).session && (!rooms || room === HANDLER);
 
   /** Applies this bot's tools and model from the configuration: at start, and when the handler changes itself. */
   async function applySelf(ctx) {
@@ -1140,7 +1237,8 @@ export default function botmode(pi) {
   function readMail(ctx, box) {
     if (!ctx.hasUI && ctx.isIdle()) return; // A worker reads messages only while it works; the rest wait for its next task.
     for (const message of takeMail(box)) {
-      if (!message.reply && waiting.has(message.from)) waiting.get(message.from)(message.text);
+      if (message.owner) pi.sendUserMessage(message.text, { deliverAs: "followUp" }); // Yours, as you would type it, from /task.
+      else if (!message.reply && waiting.has(message.from)) waiting.get(message.from)(message.text);
       else pi.sendMessage({ customType: "botmode", display: true, content: mailText(message), details: { from: message.from } }, { triggerTurn: true, deliverAs: "steer" });
     }
   }
@@ -1153,10 +1251,11 @@ export default function botmode(pi) {
     // A session that another pi works in, a bot's or your handler's own carrying on without you: this window only shows
     // it, writes nothing to it and leaves its mail alone.
     const atWork = () => session ? holder(session) : [...shared.running].some((run) => run.file === file);
-    watching = ctx.hasUI && !shared.entered.has(session) && atWork() ? session ?? HANDLER : undefined;
+    watching = ctx.hasUI && !shared.entered.has(session) && atWork() ? session ?? box : undefined;
     if (!watching) await applySelf(ctx);
     if (box && !watching) {
-      timer = setInterval(() => readMail(ctx, box), 500);
+      const boxes = main(ctx) && box !== HANDLER ? [box, HANDLER] : [box];
+      timer = setInterval(() => boxes.forEach((each) => readMail(ctx, each)), 500);
       timer.unref(); // A worker's pi exits when its task is done, whatever is still scheduled.
     }
     if (!ctx.hasUI) return;
@@ -1170,6 +1269,10 @@ export default function botmode(pi) {
     }
     if (!session) {
       shared.home = file;
+      // The rooms show a conversation that is open in one already, rather than open it twice, by the id it has here.
+      if (rooms) toRooms({ id: ctx.sessionManager.getSessionId() });
+    }
+    if (main(ctx)) {
       fs.mkdirSync(HOME, { recursive: true });
       fs.writeFileSync(WINDOW, String(process.pid)); // Other machines' handlers now talk with yours here, where you see it.
     }
@@ -1179,9 +1282,13 @@ export default function botmode(pi) {
     let screen;
     const atPrompt = () => !screen || "onExtensionShortcut" in (screen.getFocusedComponent() ?? {});
     ctx.ui.setWidget("botmode-keys", (tui) => (screen = tui, { render: () => [], invalidate: () => {} }), { placement: "belowEditor" });
+    // Ctrl+Enter sends what you typed as /task does, in terminals that tell it from Enter (the kitty or xterm way).
     ctx.ui.onTerminalInput((key) => {
-      if (!["\x1b[D", "\x1bOD"].includes(key) || ctx.ui.getEditorText() || !atPrompt()) return;
-      pi.sendUserMessage("/sessions", { expandPromptTemplates: true });
+      const text = ctx.ui.getEditorText();
+      const task = /^\x1b\[(?:13;5(?::1)?u|27;5;13~)$/.test(key) && text.trim();
+      if (!(task || (["\x1b[D", "\x1bOD"].includes(key) && !text)) || !atPrompt()) return;
+      if (task) ctx.ui.setEditorText("");
+      pi.sendUserMessage(task ? `/task ${task}` : "/sessions", { expandPromptTemplates: true });
       return { consume: true };
     });
     if (watching) {
@@ -1207,15 +1314,20 @@ export default function botmode(pi) {
     shared.render = undefined;
     const { session } = whoAmI(ctx);
     // ponytail: with two windows open, the first to leave its handler's conversation sends the rest headless; track pids if that bites.
-    if (ctx.hasUI && !session) fs.rmSync(WINDOW, { force: true });
+    if (main(ctx)) fs.rmSync(WINDOW, { force: true });
     if (event.targetSessionFile === ctx.sessionManager.getSessionFile()) return; // Opened again, as when a bot you watch is done.
     if (shared.entered.delete(session)) release(session); // You left it, so bots may work in it again.
     if (left && ["resume", "new"].includes(event.reason)) carryOn(left); // You only left the room.
   });
 
   // pi stops a session's work before it closes it, so whether it was at work shows only as you set off.
-  pi.on("session_before_switch", (_event, ctx) => {
-    left = !ctx.isIdle() && { session: whoAmI(ctx).session, file: ctx.sessionManager.getSessionFile() };
+  pi.on("session_before_switch", (event, ctx) => {
+    // /new, with your handler, starts a conversation as /task does: with an address of its own, and in a room of its own.
+    if (event.reason === "new" && ctx.hasUI && whoAmI(ctx).bot === HANDLER) {
+      pi.sendUserMessage("/task", { expandPromptTemplates: true });
+      return { cancel: true };
+    }
+    left = !ctx.isIdle() && { ...whoAmI(ctx), file: ctx.sessionManager.getSessionFile() };
   });
 
   pi.on("input", async (event, ctx) => {
@@ -1236,6 +1348,14 @@ export default function botmode(pi) {
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
     const me = whoAmI(ctx).bot;
+    // Your conversations with your handler are named after their task, once, by the helper model, for the lobby.
+    const file = ctx.sessionManager.getSessionFile();
+    if (ctx.hasUI && me === HANDLER && config.defaults?.helperModel && !pi.getSessionName() && !shared.named.has(file)) {
+      shared.named.add(file);
+      titleOf(config.defaults.helperModel, event.prompt).then((title) => {
+        if (title && ctx.sessionManager.getSessionFile() === file) pi.setSessionName(title);
+      }).catch(() => {}); // You have left it since.
+    }
     const team = teamPrompt(config, me, await remoteTeams(config), working());
     // With only the team tools, pi's coding-assistant prompt would contradict the bot's own.
     return { systemPrompt: config.bots[me].tools?.length === 0 ? team : `${event.systemPrompt}\n\n${team}` };
@@ -1315,14 +1435,17 @@ export default function botmode(pi) {
   });
 
   /**
-   * Opens session `name`, kept in `file`, in this window. In rooms a session other than this one gets a room of its own,
-   * started in `cwd`, and this one stays as it is, out of sight; without rooms pi opens it in place of this one.
+   * Opens session `name`, kept in `file`, in this window: a bot's, or a conversation of your handler's. In rooms a session
+   * other than this one gets a room of its own, started in `cwd`, and this one stays as it is, out of sight; without rooms
+   * pi opens it in place of this one.
    */
   function enter(ctx, name, file, cwd) {
     const me = whoAmI(ctx);
-    if (!rooms || name === (me.session ?? HANDLER)) return ctx.switchSession(file);
+    if (!rooms || name === (me.session ?? me.box)) return ctx.switchSession(file);
     if (cwd && !isFolder(cwd)) throw new Error(`its folder ${cwd} is gone`);
-    return toRooms({ busy: busy(ctx, me.box), open: name, ...(cwd && { args: ["--session-dir", SESSIONS, "--session", file], cwd }) });
+    const dir = cwd && path.dirname(file);
+    return toRooms({ busy: busy(ctx, me.box), open: name, ...(cwd && { args: ["--session-dir", dir, "--session", file], cwd }),
+      ...(cwd && dir !== SESSIONS && { handler: true }) }); // The rooms give your handler's its extensions.
   }
 
   /**
@@ -1366,18 +1489,30 @@ export default function botmode(pi) {
   }
 
   pi.registerCommand("sessions", {
-    description: "See every bot session and open one to talk with that bot, or watch it work; /sessions <id> opens that one, and /sessions handler your own",
+    description: "See your conversations with your handler and every bot session, and open one, or watch it work; /sessions <id> opens that one, and /sessions handler your own",
     async handler(args, ctx) {
       const config = loadConfig();
       const here = whoAmI(ctx).session;
       const busy = new Map(working().map((session) => [session.id, session.task]));
       const files = sessionFiles();
+      // Your handler's conversations from every folder, which this window's own leads when pi keeps it elsewhere.
+      const current = ctx.sessionManager.getSessionFile();
+      const talks = conversations(LOBBY);
+      if (shared.home && !talks.some((talk) => talk.file === shared.home)) talks.unshift(about(shared.home));
       const id = args.trim();
       if (id === HANDLER) return enter(ctx, HANDLER, shared.home); // Your handler's conversation.
+      const talk = id && talks.find((entry) => entry.id === id);
+      if (talk) return enter(ctx, talk.id, talk.file, talk.cwd);
       if (id) return files.has(id) || busy.has(id) ? focus(ctx, id) : ctx.ui.notify(`There is no session ${id} here.`, "warning");
-      const homeAtWork = [...shared.running].some((run) => run.file === shared.home);
-      const choices = new Map([[`${HANDLER} · ${here ? "back to your conversation" : "you are here"}${homeAtWork ? " · working" : ""}`,
-        () => here ? enter(ctx, HANDLER, shared.home) : watching && watch(ctx, HANDLER)]]);
+      const choices = new Map();
+      for (const talk of talks) {
+        const [mine, home] = [talk.file === current, talk.file === shared.home];
+        if (!talk.title && !mine && !home) continue; // Never written in.
+        const state = mine ? "you are here" : home ? "back to your conversation" : ago(talk.file);
+        const atWork = [...shared.running].some((run) => run.file === talk.file);
+        choices.set(`${painted(HANDLER, talk.title || "New conversation")} · ${state}${atWork ? " · working" : ""}${talk.cwd ? ` · ${talk.cwd}` : ""}`,
+          () => mine ? watching && watch(ctx, watching) : home ? enter(ctx, HANDLER, shared.home) : enter(ctx, talk.id, talk.file, talk.cwd));
+      }
       for (const session of new Set([...files.keys(), ...busy.keys()])) {
         // handler here is another machine's handler talking with this one, not a bot of yours; skip removed and archived bots too.
         if (!inLobby(config, session)) continue;
@@ -1399,6 +1534,52 @@ export default function botmode(pi) {
       }
       const choice = await ctx.ui.select("Sessions", [...choices.keys()]);
       if (choice) await choices.get(choice)();
+    },
+  });
+
+  pi.registerCommand("task", {
+    description: "Start a new conversation with your handler, apart from this one, with this message: /task <message>. Ctrl+Enter sends what you typed the same way",
+    async handler(args, ctx) {
+      const file = newConversation(ctx.cwd);
+      const id = idOf(path.basename(file));
+      if (args.trim()) post(id, { text: args.trim(), owner: true }); // It sends your message as it opens.
+      await enter(ctx, id, file, ctx.cwd);
+    },
+  });
+
+  /** A model you are signed in to, from pi's menu one "/" level at a time, as `botmode setup` does; "" for `none`, undefined to go back. */
+  async function chooseModel(ctx, title, none) {
+    const available = await ctx.modelRegistry.getAvailable();
+    const ids = available.map((model) => `${model.provider}/${model.id}`);
+    for (let prefix = ""; ;) {
+      const entries = [...new Set(ids.filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length).replace(/\/.*/, "/")))];
+      const picked = await ctx.ui.select(`${title}${prefix && ` · ${prefix}`}`, [...(prefix ? [] : [none]), ...entries]); // A group ends in "/".
+      if (!picked) return undefined;
+      if (picked === none) return "";
+      prefix += picked;
+      if (picked.endsWith("/")) continue;
+      if (!available[ids.indexOf(prefix)].reasoning) return prefix;
+      const level = await ctx.ui.select(`Thinking for ${prefix}`, THINKING);
+      return level ? `${prefix}:${level}` : prefix; // None picked: the model's own.
+    }
+  }
+
+  pi.registerCommand("botmode", {
+    description: "Botmode's settings: your bots' model, and the helper model that names your conversations with your handler",
+    async handler(_args, ctx) {
+      const settings = { model: ["Bots' model", "pi's default"], helperModel: ["Helper model", "None: the lobby shows a conversation's first words"] };
+      for (;;) {
+        const defaults = loadConfig().defaults ?? {};
+        const rows = new Map(Object.entries(settings).map(([field, [label, none]]) => [`${label} · ${defaults[field] || none}`, field]));
+        const field = rows.get(await ctx.ui.select("Botmode settings", [...rows.keys()]));
+        if (!field) return;
+        const [label, none] = settings[field];
+        const spec = await chooseModel(ctx, label, none);
+        if (spec === undefined) continue;
+        const found = applyPatch({ defaults: { [field]: spec || null } });
+        if (found.length) ctx.ui.notify(`botmode: ${found.join("; ")}`, "warning");
+        else if (field === "model") await applySelf(ctx); // The rest read it as they start.
+      }
     },
   });
 

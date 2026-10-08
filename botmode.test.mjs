@@ -13,17 +13,18 @@ process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agen
 process.env.BOTMODE_PI = fileURLToPath(new URL("fake-pi.mjs", import.meta.url)); // Bots run as fake-pi.mjs,
 process.env.BOTMODE_CLAUDE = fileURLToPath(new URL("fake-claude.mjs", import.meta.url)); // and Claude Code bots as fake-claude.mjs,
 process.env.BOTMODE_BILI = fileURLToPath(new URL("fake-bili.mjs", import.meta.url)); // through fake-bili.mjs.
-const { default: botmode, BILLION_CONTEXT, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, handOver, inviteCode, leavesClaude, loadConfig, mergePatch, problems,
+const { default: botmode, BILLION_CONTEXT, DEFAULT, HOME, MAX_CHAIN, applyPatch, callHost, colourOf, conversationIn, handOver, inviteCode, leavesClaude, loadConfig, mergePatch, newConversation, problems,
   readInvite, refusal, remoteTeams, saveToken, serve, setHost, teamPrompt, working } = await import("./botmode.mjs");
 
 /**
  * Loads the extension the way pi does: in the owner's window (no session), or in a bot's session such as "research.2",
- * which a window shows when you enter it and a bot's own pi runs without one.
+ * which a window shows when you enter it and a bot's own pi runs without one. `conversation` is the file of one of your
+ * handler's conversations in ~/.botmode/handler, which the window then has open instead of the owner's own.
  */
-async function open(session, { window = !session, theirs = [] } = {}) { // theirs: tools other extensions registered.
+async function open(session, { window = !session, theirs = [], conversation } = {}) { // theirs: tools other extensions registered.
   const tools = {}, commands = {}, events = {}, sent = [], status = {}, switched = [], notes = [], dispatched = [];
   const screen = { text: "", menu: false }; // What is typed at the prompt, and whether a menu has the keyboard instead.
-  let keys;
+  let keys, name;
   botmode({
     on: (name, handler) => { events[name] = handler; },
     registerTool: (tool) => { tools[tool.name] = tool; },
@@ -35,9 +36,12 @@ async function open(session, { window = !session, theirs = [] } = {}) { // their
     getAllTools: () => theirs,
     setModel: async () => true,
     setThinkingLevel: () => {},
+    setSessionName: (text) => { name = text; },
+    getSessionName: () => name,
   });
   const ctx = {
     hasUI: window,
+    cwd: process.cwd(),
     isIdle: () => window, // A bot's own pi is at work; a window waits for you.
     ui: { notify: (text) => notes.push(text), setStatus: (key, text) => { status[key] = text; }, select: async () => undefined,
       confirm: async () => false, input: async () => undefined, getEditorText: () => screen.text, setEditorText: (text) => { screen.text = text; },
@@ -45,19 +49,20 @@ async function open(session, { window = !session, theirs = [] } = {}) { // their
       setWidget: (_key, content) => typeof content === "function" && content({ getFocusedComponent: () => screen.menu ? {} : { onExtensionShortcut: undefined } }),
       onTerminalInput: (handler) => { keys = handler; return () => {}; } },
     sessionManager: {
-      getSessionId: () => session ?? "owner",
-      getSessionDir: () => session ? path.join(HOME, "sessions") : path.join(HOME, "owner"),
-      getSessionFile: () => session ? fileOf(session) : path.join(HOME, "owner", "owner.jsonl"),
+      getSessionId: () => session ?? (conversation ? JSON.parse(fs.readFileSync(conversation, "utf-8").split("\n")[0]).id : "owner"),
+      getSessionDir: () => session ? path.join(HOME, "sessions") : conversation ? path.dirname(conversation) : path.join(HOME, "owner"),
+      getSessionFile: () => session ? fileOf(session) : conversation ?? path.join(HOME, "owner", "owner.jsonl"),
     },
     modelRegistry: { find: () => undefined },
     switchSession: async (file) => { switched.push(file); return { cancelled: false }; },
   };
   await events.session_start({ type: "session_start" }, ctx);
   const call = async (name, params) => (await tools[name].execute("call", params, undefined, undefined, ctx)).content[0].text;
-  return { ctx, call, commands, sent, status, switched, notes, dispatched, screen,
-    prompt: async () => (await events.before_agent_start({ type: "before_agent_start", systemPrompt: "pi's prompt" }, ctx)).systemPrompt,
+  return { ctx, call, commands, sent, status, switched, notes, dispatched, screen, name: () => name,
+    prompt: async (text = "") => (await events.before_agent_start({ type: "before_agent_start", prompt: text, systemPrompt: "pi's prompt" }, ctx)).systemPrompt,
     skills: async () => (await events.resources_discover({ type: "resources_discover", cwd: HOME, reason: "startup" }, ctx))?.skillPaths ?? [],
     press: (key) => keys(key), type: (text) => events.input({ type: "input", text, source: "interactive" }, ctx),
+    startNew: () => events.session_before_switch({ type: "session_before_switch", reason: "new" }, ctx), // pi's /new.
     toolCall: (toolName) => events.tool_call?.({ type: "tool_call", toolCallId: "call", toolName, input: {} }, ctx),
     close: (event = { reason: "quit" }) => events.session_shutdown({ type: "session_shutdown", ...event }, ctx),
     // pi switching this window to another session: it asks first, stops what this one does, then closes it.
@@ -76,6 +81,27 @@ async function until(check, ms = 8000) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${check}`);
   }
 }
+
+/** Stands in for the botmode command's rooms, as this window's pis, in room `room`, see them: what they ask is in `asked`. */
+async function inRooms(room) {
+  const asked = [];
+  const server = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    asked.push(JSON.parse(body));
+    res.end();
+  });
+  await once(server.listen(0, "127.0.0.1"), "listening");
+  Object.assign(process.env, { BOTMODE_ROOMS: `http://127.0.0.1:${server.address().port}/secret`, BOTMODE_ROOM: room });
+  return { asked, opened: () => asked.filter((message) => message.open), done: () => {
+    delete process.env.BOTMODE_ROOMS;
+    delete process.env.BOTMODE_ROOM;
+    server.close();
+  } };
+}
+
+const CONVERSATIONS = path.join(HOME, "handler");
+const idOf = (file) => path.basename(file, ".jsonl").slice(path.basename(file).indexOf("_") + 1);
 
 test("merge patches merge objects, delete on null and replace everything else", () => {
   const merged = mergePatch({ a: { b: 1, c: 2 }, list: [1] }, { a: { b: null, d: 3 }, list: [2], e: "x" });
@@ -213,7 +239,7 @@ test("/sessions enters a bot's session as that bot, and the overview goes back t
   };
   try {
     await handler.commands.sessions.handler("", handler.ctx);
-    assert.equal(shown[0], "handler · you are here");
+    assert.equal(shown[0], `\x1b[1;38;5;${colourOf("handler")}mNew conversation\x1b[22;39m · you are here`); // Yours, in your handler's colour.
     assert.match(shown.join("\n"), /^research\.2 · idle · /m);
     assert.match(handler.switched[0], /_research\.2\.jsonl$/);
     // pi opens research.2's session in this window: you now talk with that copy of research directly.
@@ -348,7 +374,7 @@ test("leaving a session at work leaves it working: it carries on without you, an
     copy.ctx.ui.select = async (_title, options) => (shown = options, options[0]);
     copy.ctx.isIdle = () => false; // and so does research.2 when you go back mid-reply.
     await copy.commands.sessions.handler("", copy.ctx);
-    assert.equal(shown[0], "handler · back to your conversation · working");
+    assert.match(shown[0], / · back to your conversation · working · /);
     await copy.leave(home);
     assert.match(working().find((session) => session.id === "research.2")?.task ?? "", /^Carry on where you stopped/);
     // Your handler's conversation is still at work: you watch it, and what you type reaches it.
@@ -747,4 +773,212 @@ test("billion-context keeps every bot's context small: bots in Claude Code go th
   } finally {
     handler.close();
   }
+});
+
+test("/task starts a new conversation with your handler in a room of its own, and your message is its first", async () => {
+  const rooms = await inRooms("handler");
+  const handler = await open();
+  let task;
+  try {
+    await handler.commands.task.handler("-r book flights to Tokyo", handler.ctx); // pi would take -r for a flag of its own.
+    const [{ busy, ...request }] = rooms.opened();
+    const file = request.args.at(-1);
+    assert.deepEqual(request, { room: "handler", open: "handler.1", handler: true,
+      args: ["--session-dir", CONVERSATIONS, "--session", file], cwd: process.cwd() });
+    assert.equal(idOf(file), "handler.1");
+    // Its room: a conversation of its own, which pi opens and sends your message in.
+    process.env.BOTMODE_ROOM = "handler.1";
+    task = await open(undefined, { conversation: file });
+    await until(() => task.dispatched.length);
+    assert.deepEqual(task.dispatched, ["-r book flights to Tokyo"]);
+  } finally {
+    rooms.done();
+    handler.close();
+    task?.close();
+  }
+});
+
+test("each conversation with your handler has an address, where the replies and messages of the bots it hands work to reach it", async () => {
+  applyPatch({ bots: { research: { name: "Researcher", description: "Finds and summarizes sources" } } });
+  const handler = await open(); // A conversation from before they had addresses.
+  await handler.commands.task.handler("", handler.ctx); // Without rooms, pi opens the new one in this window.
+  const task = await open(undefined, { conversation: handler.switched[0] });
+  const address = idOf(handler.switched[0]);
+  let research;
+  try {
+    assert.match(await task.call("handoff", { bot: "research", session: "fresh", task: "slow: compare fares" }), /working on it/);
+    await until(() => task.sent.length);
+    assert.match(task.sent[0].content, new RegExp(`message ${address.replace(".", "\\.")}\\]\\nslow: compare fares$`));
+    research = await open("research"); // A bot at work.
+    assert.equal(await research.call("message", { to: address, text: "Found three." }), `Sent to ${address}.`);
+    await until(() => task.sent.length > 1);
+    assert.equal(task.sent[1].content, "[Message from research; answer with message to research]\nFound three.");
+    assert.ok(!handler.sent.some((message) => /fares|Found three/.test(message.content)));
+    assert.match(await research.call("message", { to: "handler.99", text: "hi" }), /^handler\.99 is not working right now/);
+    // A bot on another machine, at work on a task from your handler, reaches the conversation as pc/handler.1.
+    saveToken("d".repeat(64));
+    const server = serve(0);
+    await once(server, "listening");
+    const message = async (body) => (await (await callHost(`http://127.0.0.1:${server.address().port}`, "message", body)).json()).text;
+    try {
+      assert.equal(await message({ to: address, from: "mac/a", text: "From the Mac.", chain: ["pc/handler"] }), `Sent to ${address}.`);
+      await until(() => task.sent.length > 2);
+      assert.equal(task.sent[2].content, "[Message from mac/a; answer with message to mac/a]\nFrom the Mac.");
+      assert.match(await message({ to: address, from: "mac/a", text: "hi" }), /^Refused: pc's handler hears only from your handler/);
+    } finally {
+      server.close();
+    }
+  } finally {
+    handler.close();
+    task.close();
+    research?.close();
+  }
+});
+
+test("the lobby lists your handler's conversations from every folder, newest first, by name and in its colour, above the bots'", async () => {
+  applyPatch({ bots: { research: { name: "Researcher", description: "Finds and summarizes sources" } } });
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "elsewhere-"));
+  const handler = await open();
+  const start = async (cwd, ...entries) => {
+    handler.ctx.cwd = cwd;
+    await handler.commands.task.handler("", handler.ctx);
+    const file = handler.switched.at(-1);
+    for (const entry of entries) fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 20)); // Newer by a clear margin.
+    return file;
+  };
+  const said = (text) => ({ type: "message", message: { role: "user", content: [{ type: "text", text }] } });
+  const tokyo = await start(elsewhere, said("Compare  flight prices\nto Tokyo for May"));
+  await start(process.cwd()); // Never written in, so not listed.
+  const build = await start(process.cwd(), said("the build fails on main"), { type: "session_info", name: "Fix the build" });
+  const paint = (text) => `\x1b[1;38;5;${colourOf("handler")}m${text}\x1b[22;39m`;
+  let shown, rooms, main;
+  handler.ctx.ui.select = async (_title, options) => (shown = options).find((option) => option.includes("Tokyo"));
+  try {
+    assert.match(await handler.call("handoff", { bot: "research", session: "fresh", task: "hello" }), /replied/); // A bot session.
+    await handler.commands.sessions.handler("", handler.ctx);
+    const talks = shown.filter((option) => option.startsWith("\x1b[1;38;5;"));
+    assert.match(talks[0], / · you are here/);
+    assert.deepEqual(talks.slice(1), [`${paint("Fix the build")} · just now · ${process.cwd()}`,
+      `${paint("Compare flight prices to Tokyo for May")} · just now · ${elsewhere}`]);
+    assert.ok(shown.indexOf(talks.at(-1)) < shown.findIndex((option) => option.startsWith("research")));
+    assert.equal(handler.switched.at(-1), tokyo); // Without rooms, pi opens it in this window.
+    await handler.commands.sessions.handler(idOf(build), handler.ctx);
+    assert.equal(handler.switched.at(-1), build);
+    // In rooms it opens in a room of its own, in its folder. A room tells the rooms which conversation it has, so a
+    // conversation that is open already is shown, never opened twice.
+    rooms = await inRooms("handler");
+    main = await open();
+    main.ctx.ui.select = async (_title, options) => options.find((option) => option.includes("Tokyo"));
+    await main.commands.sessions.handler("", main.ctx);
+    assert.deepEqual(rooms.opened().map(({ busy, ...request }) => request), [{ room: "handler", open: idOf(tokyo), handler: true,
+      args: ["--session-dir", CONVERSATIONS, "--session", tokyo], cwd: elsewhere }]);
+    assert.ok(rooms.asked.some((message) => message.room === "handler" && message.id === "owner"));
+  } finally {
+    rooms?.done();
+    handler.close();
+    main?.close();
+  }
+});
+
+test("a helper model names each conversation with your handler after its task; without one, the lobby shows its first words", async () => {
+  assert.match(applyPatch({ defaults: { helperModel: 7 } }).join(), /defaults must be/);
+  assert.deepEqual(applyPatch({ defaults: { helperModel: "fake/mini:high" } }), []);
+  const handler = await open();
+  const conversation = async () => {
+    await handler.commands.task.handler("", handler.ctx);
+    return open(undefined, { conversation: handler.switched.at(-1) });
+  };
+  const [named, plain] = [await conversation(), await conversation()];
+  try {
+    await named.prompt("book flights to Tokyo for the May trip");
+    await until(() => named.name());
+    assert.equal(named.name(), "fake/mini named it: book flights to Tokyo for the May trip");
+    await named.prompt("and a hotel"); // Named once.
+    assert.equal(named.name(), "fake/mini named it: book flights to Tokyo for the May trip");
+    assert.deepEqual(applyPatch({ defaults: { helperModel: null } }), []);
+    await plain.prompt("fix the build");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(plain.name(), undefined);
+  } finally {
+    handler.close();
+    named.close();
+    plain.close();
+  }
+});
+
+test("Ctrl+Enter sends what you typed to a new conversation with your handler, as /task does", async () => {
+  const handler = await open();
+  try {
+    assert.equal(handler.press("\x1b[13;5u"), undefined); // Nothing typed: Ctrl+Enter is pi's again.
+    handler.screen.text = "fix the build";
+    assert.deepEqual(handler.press("\x1b[13;5u"), { consume: true });
+    assert.equal(handler.screen.text, "");
+    handler.screen.text = "and the docs";
+    assert.deepEqual(handler.press("\x1b[27;5;13~"), { consume: true }); // Terminals that report keys the older way.
+    handler.screen.text = "a menu is open";
+    handler.screen.menu = true;
+    assert.equal(handler.press("\x1b[13;5u"), undefined);
+    assert.deepEqual(handler.dispatched, ["/task fix the build", "/task and the docs"]);
+  } finally {
+    handler.close();
+  }
+});
+
+test("pi's /new, in a conversation with your handler, starts one as /task does, with an address of its own", async () => {
+  const handler = await open();
+  try {
+    assert.deepEqual(await handler.startNew(), { cancel: true });
+    assert.deepEqual(handler.dispatched, ["/task"]);
+  } finally {
+    handler.close();
+  }
+});
+
+test("/botmode sets your bots' model and the helper model in pi's menu, from your sign-ins, a provider at a time", async () => {
+  const handler = await open();
+  const menus = [];
+  // Each answer picks the option it begins; none goes back.
+  const answers = ["Helper model", "fake/", "mini", "Bots' model", "fake/", "big", "high", "Helper model", "None"];
+  handler.ctx.modelRegistry.getAvailable = () => [{ provider: "fake", id: "big", reasoning: true }, { provider: "fake", id: "mini" },
+    { provider: "other", id: "x" }];
+  handler.ctx.ui.select = async (title, options) => {
+    menus.push([title, ...options]);
+    const answer = answers.shift();
+    return answer && options.find((option) => option.startsWith(answer));
+  };
+  try {
+    await handler.commands.botmode.handler("", handler.ctx);
+    assert.deepEqual(menus[0], ["Botmode settings", "Bots' model · pi's default", "Helper model · None: the lobby shows a conversation's first words"]);
+    assert.deepEqual(menus[1].slice(1), ["None: the lobby shows a conversation's first words", "fake/", "other/"]);
+    assert.deepEqual(menus[2].slice(1), ["big", "mini"]);
+    assert.deepEqual(menus[3].slice(1), ["Bots' model · pi's default", "Helper model · fake/mini"]);
+    assert.ok(menus[6].includes("high"));
+    assert.deepEqual(menus[7].slice(1), ["Bots' model · fake/big:high", "Helper model · fake/mini"]);
+    assert.deepEqual(loadConfig().defaults, { model: "fake/big:high" });
+    assert.equal(menus.length, 10); // The menu again, then you leave it.
+  } finally {
+    applyPatch({ defaults: { model: null } });
+    handler.close();
+  }
+});
+
+test("botmode carries on your handler's newest conversation in the folder you start in, or starts one there", async () => {
+  const [here, there] = [fs.mkdtempSync(path.join(os.tmpdir(), "here-")), fs.mkdtempSync(path.join(os.tmpdir(), "there-"))];
+  const say = (file, text, after) => {
+    fs.appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "user", content: text } })}\n`);
+    fs.utimesSync(file, new Date(), new Date(Date.now() + after));
+  };
+  const first = conversationIn(here);
+  assert.equal(path.dirname(first), CONVERSATIONS);
+  assert.equal(conversationIn(here), first); // Not yet talked in, so it is the one to carry on, not another.
+  const elsewhere = conversationIn(there);
+  assert.notEqual(elsewhere, first);
+  say(first, "fix the build", 1000);
+  const later = newConversation(here); // As /task with nothing typed, or a window you closed at once, leaves one.
+  fs.utimesSync(later, new Date(), new Date(Date.now() + 2000));
+  assert.equal(conversationIn(here), first);
+  say(later, "and the docs", 3000);
+  assert.equal(conversationIn(here), later);
+  assert.equal(conversationIn(there), elsewhere);
 });

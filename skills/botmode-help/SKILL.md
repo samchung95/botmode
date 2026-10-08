@@ -8,22 +8,27 @@ description: How to use Botmode and fix it. Its commands, where its files are, M
 ## Commands
 
 The owner runs these in a terminal:
-- `botmode`: the window, with you. It carries on your last conversation with the owner in the folder it starts in; `/new` starts a fresh one, and `botmode -r` picks another. `botmode -p "..."` sends you one message without the window, in that same conversation.
-- `botmode setup`: model sign-in, the bots' model, Claude Code's sign-in, and letting other machines connect. `botmode setup <invite>` connects this machine to the one that printed the invite.
+- `botmode`: the window, with you. It carries on your last conversation with the owner in the folder it starts in, and `botmode -r` picks another. `botmode -p "..."` sends you one message without the window, in that same conversation.
+- `botmode setup`: model sign-in, the bots' model, the helper model that names your conversations, Claude Code's sign-in, and letting other machines connect. `botmode setup <invite>` connects this machine to the one that printed the invite.
 - `botmode invite`: prints the invite again. It holds the secret the machines share, so the owner sends it only to themselves.
-- `botmode status`: sign-ins, model, bots, host, tailnet, what is at work, and the other machines.
+- `botmode status`: sign-ins, the bots' and helper's models, bots, host, tailnet, what is at work, and the other machines.
 - `botmode restart` restarts this machine's host. `botmode update` installs the latest Botmode, then restarts it.
 - `botmode teardown`: disconnects this machine and stops its host. It asks before deleting the bots.
 
 You may run `botmode status` yourself. The others ask questions or print the secret, so tell the owner which to run.
 
-In the window: `/sessions`, or ← on an empty prompt, is the lobby; `/sessions <id>` opens a session; `/bot <id> <message>` talks to one bot directly; `/model` changes the model.
+In the window:
+- `/task <message>`, or Ctrl+Enter on what the owner typed, starts a new conversation with you, apart from the current one, in a room of its own; pi's `/new` does the same. Each conversation has an address, `handler.1`, `handler.2`…, where its bots' replies and messages reach it.
+- `/sessions`, or ← on an empty prompt, is the lobby: your conversations from every folder at the top, named after their task in your colour, then the bot sessions. `/sessions <id>` opens a session or a conversation.
+- `/bot <id> <message>` talks to one bot directly.
+- `/model` changes the model of this session.
+- `/botmode` is the settings: the bots' default model and the helper model.
 
 ## Files
 
 Botmode keeps its files in `~/.botmode` (`$BOTMODE_HOME`):
 - `config.json`: the team. Change it with `configure`, not by hand.
-- `handler/`: your conversations with the owner.
+- `handler/`: your conversations with the owner, from every folder, as `<time>_handler.<n>.jsonl`.
 - `sessions/`: every bot session, as `<time>_<session>.jsonl`.
 - `bots/<id>/`: the folder of a bot with no `workspace`.
 - `mail/<session>/`: messages not read yet.
@@ -58,3 +63,5 @@ Every bot, you included, works through billion-context: a proxy between it and i
 - **A bot's model requests fail with a connection error.** They go through billion-context's proxy. Its log, `~/.local/state/billion-context/bili.log`, says why. A bot in Claude Code gets a new proxy when it next starts; a bot in pi, on its next run.
 - **`botmode update` says EBUSY.** Another botmode window is using its files: close every other window, then run it again.
 - **Every room closed at once.** Quitting your own room closes them all and stops their work.
+- **Ctrl+Enter types a new line, or sends the message here, instead of starting a task.** The terminal does not tell Ctrl+Enter apart. `/task <message>` works in any terminal. In Windows Terminal, the owner adds `{"command": {"action": "sendInput", "input": "\u001b[13;5u"}, "keys": "ctrl+enter"}` to the `actions` in its settings; Ctrl+J still types a new line.
+- **Conversations in the lobby have no names, only their first words.** There is no helper model, or it is unavailable. `/botmode` sets one; only conversations in the window are named, once each.

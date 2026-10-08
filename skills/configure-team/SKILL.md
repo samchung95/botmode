@@ -13,13 +13,14 @@ Look before you change: `configure` with the empty patch `{}` changes nothing an
 
 ```json
 {
-  "defaults": {"model": "provider/model:thinking"},
+  "defaults": {"model": "provider/model:thinking", "helperModel": "provider/model"},
   "bots": {"<id>": {"name": "...", "description": "..."}},
   "hosts": {"<id>": {"url": "https://..."}}
 }
 ```
 
 - `defaults.model` is the model of every bot that names none: `provider/model`, or `provider/model:thinking` with a thinking level of off, minimal, low, medium, high or xhigh. Empty uses pi's default.
+- `defaults.helperModel` is a small, quick model, in the same form, that names your conversations with the owner after their task, for the lobby. Its thinking is off unless it names a level. Empty names none, and the lobby shows each conversation's first words. The owner can also set both in the window with `/botmode`.
 - `bots` is the team. An id is 1-32 lowercase letters, digits or `-`, starting with a letter. It is also the bot's session, and its copies are `<id>.2`, `<id>.3`… `bots.handler` is you: your tools, model and instructions, which apply at once. You cannot be removed or archived.
 - `hosts` are the owner's other machines, whose bots join the team as `host/bot`. Only the owner sets them, with `botmode setup <invite>`; configure refuses them. To create or change bots on another machine, ask its handler, `host/handler`.
 

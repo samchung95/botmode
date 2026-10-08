@@ -10,8 +10,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ASK_USER, BILLION_CONTEXT, HANDLER, HOME, MCP_ADAPTER, OPEN, PORT, applyPatch, callHost, claim, hasToken, inviteCode, leavesClaude, loadConfig,
-  readInvite, release, remoteTeams, saveToken, serve, setHost, token, working } from "./botmode.mjs";
+import { ASK_USER, BILLION_CONTEXT, HANDLER, HOME, MCP_ADAPTER, OPEN, PORT, applyPatch, callHost, claim, conversationIn, hasToken, inviteCode,
+  leavesClaude, loadConfig, readInvite, release, remoteTeams, saveToken, serve, setHost, token, working } from "./botmode.mjs";
 
 const CLI = fileURLToPath(import.meta.url);
 const EXTENSION = fileURLToPath(new URL("botmode.mjs", import.meta.url));
@@ -20,9 +20,10 @@ const DRAWING = fileURLToPath(new URL("botmode-tui.mjs", import.meta.url)); // L
 const LOADS = [EXTENSION, DRAWING, MCP_ADAPTER, BILLION_CONTEXT].flatMap((file) => ["-e", file]);
 const HANDLER_LOADS = [...LOADS, "-e", ASK_USER];
 // Your handler carries on its last conversation in the folder you start in, as pi's -c does, unless you name a session.
-// Its conversations stay apart from those of the pi you run yourself, in ~/.botmode/handler.
+// Its conversations, from every folder, stay apart from those of the pi you run yourself, in ~/.botmode/handler.
 const PICKS = ["-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork", "--no-session"];
-const handlerArgs = (args) => ["--session-dir", path.join(HOME, "handler"), ...(args.some((arg) => PICKS.includes(arg)) ? [] : ["--continue"]), ...args];
+const handlerArgs = (args) => ["--session-dir", path.join(HOME, "handler"),
+  ...(args.some((arg) => PICKS.includes(arg)) ? [] : ["--session", conversationIn(process.cwd())]), ...args];
 // pi comes with this package. Its command is dist/bundle/cli.js, beside the dist/index.js the package exports.
 const PI = path.join(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
 process.env.BOTMODE_PI = PI;
@@ -43,7 +44,7 @@ const SUDOERS = "/etc/sudoers.d/botmode"; // On macOS, lets your bots use sudo w
 const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"]; // pi's thinking levels.
 const THINKING = new RegExp(`:(${LEVELS.join("|")})$`);
 const HELP = `botmode                  talk to your handler in pi's TUI; other arguments go to pi
-botmode setup            sign in to a model and Claude Code, pick your bots' model, and let your other machines connect
+botmode setup            sign in to a model and Claude Code, pick your bots' and helper's models, and let your other machines connect
 botmode setup <invite>   connect this machine to the one that printed the invite
 botmode invite           print an invite for another machine
 botmode status           show this machine's sign-ins, model, bots, host and connected machines
@@ -182,14 +183,15 @@ async function pickModel(ids) {
   }
 }
 
-/** Shows your bots' default model and lets you pick another from your sign-ins. */
-async function chooseModel(runtime) {
+/** Shows your bots' default model, or your helper's (`field` "helperModel"), and lets you pick another from your sign-ins. */
+async function chooseModel(runtime, field = "model") {
   const available = await runtime.getAvailable();
   const ids = available.map((model) => `${model.provider}/${model.id}`);
-  const current = loadConfig().defaults?.model ?? "";
-  if (!current) say("Your bots use pi's default model.");
-  else if (ids.includes(current.replace(THINKING, ""))) say(`Your bots use ${current}.`);
-  else say(`Your bots are set to ${current}, which none of your sign-ins offers.`);
+  const current = loadConfig().defaults?.[field] ?? "";
+  const [they, use, are] = field === "model" ? ["Your bots", "use", "are"] : ["Your helper", "uses", "is"];
+  if (!current) say(field === "model" ? "Your bots use pi's default model." : "You have no helper, so the lobby shows each conversation's first words.");
+  else if (ids.includes(current.replace(THINKING, ""))) say(`${they} ${use} ${current}.`);
+  else say(`${they} ${are} set to ${current}, which none of your sign-ins offers.`);
   if (!ids.length) return;
   let model = await pickModel(ids);
   if (!model) return;
@@ -197,8 +199,8 @@ async function chooseModel(runtime) {
     const level = await pick("Thinking level (number, Enter for the model's default):", LEVELS.map((label) => ({ label })));
     if (level) model += `:${level.label}`;
   }
-  applyPatch({ defaults: { model } });
-  say(`Your bots now use ${model}.`);
+  applyPatch({ defaults: { [field]: model } });
+  say(`${they} now ${use} ${model}.`);
 }
 
 /** This machine on your tailnet as {cli, name, url}, or {problem} saying what to fix. */
@@ -445,9 +447,11 @@ async function setup(code) {
   }
   say("\n2. Your bots' model");
   await chooseModel(pi.runtime);
-  say('\n3. Claude Code, which coding bots ("agent": "claude") work in');
+  say("\n3. A helper model, small and quick, that names your conversations with your handler after their task");
+  await chooseModel(pi.runtime, "helperModel");
+  say('\n4. Claude Code, which coding bots ("agent": "claude") work in');
   await claudeStep();
-  say("\n4. Your other machines");
+  say("\n5. Your other machines");
   if (invite) await join(invite, net);
   else if (await hostAnswers()) {
     if (!net.problem) await share(net); // A restart, so an updated Botmode takes effect.
@@ -460,10 +464,10 @@ async function setup(code) {
     }
   }
   if (process.platform === "darwin") {
-    say("\n5. Admin rights");
+    say("\n6. Admin rights");
     await sudoStep();
   }
-  say("\nDone. Run `botmode` to talk to your handler, or `botmode status` to check this machine.");
+  say("\nDone. Run `botmode` to talk to your handler, where /botmode changes these models, or `botmode status` to check this machine.");
 }
 
 async function invite() {
@@ -480,6 +484,7 @@ async function status() {
   const teams = await remoteTeams(config);
   say(`Engine    pi ${pi.version}, signed in to ${providersOf(await usableModels(pi.runtime)).join(", ") || "nothing yet (run botmode setup)"}`);
   say(`Model     ${config.defaults?.model || "pi's default"}`);
+  say(`Helper    ${config.defaults?.helperModel || "none (the lobby shows each conversation's first words)"}`);
   const claude = claudeSignIn();
   say(`Claude    Claude Code ${JSON.parse(fs.readFileSync(CLAUDE_PACKAGE, "utf-8")).version}, ` +
     `${claude.loggedIn ? `signed in (${claude.authMethod})` : "not signed in (run botmode setup)"}`);
@@ -558,7 +563,7 @@ async function openWindow(args) {
       fs.chmodSync(path.join(path.dirname(createRequire(import.meta.url).resolve("node-pty")), "..", "prebuilds", `darwin-${process.arch}`, "spawn-helper"), 0o755);
     } catch {} // An install you cannot change: if node-pty then cannot start a terminal, you get one pi below.
   }
-  const rooms = new Map(); // name -> {term, busy}, and for Claude Code what leavesClaude keeps
+  const rooms = new Map(); // name -> {term, busy, id}, and for Claude Code what leavesClaude keeps
   const piModes = new Set(); // Bracketed paste and modified keys, as pi set them, which Claude Code turns off as it leaves.
   let shown, started = 0, seen = 0; // Rooms started, and those that ended in sight.
   const secret = crypto.randomBytes(16).toString("hex");
@@ -568,11 +573,17 @@ async function openWindow(args) {
     res.end();
     if (req.url !== `/${secret}`) return;
     try {
-      const { room, busy, open, args, cwd, claude } = JSON.parse(body);
+      const { room, busy, open, args, cwd, claude, handler, id } = JSON.parse(body);
+      // The conversation a room has open, so that it is shown, not opened in a second room, when you ask for it by its id.
+      if (typeof id === "string") {
+        if (rooms.has(room)) rooms.get(room).id = id;
+        return;
+      }
       if (rooms.has(room)) rooms.get(room).busy = busy === true;
       if (typeof open === "string") {
-        if (!rooms.has(open) && Array.isArray(args)) start(open, args, cwd, claude === true);
-        show(open);
+        const name = [...rooms.keys()].find((each) => rooms.get(each).id === open) ?? open;
+        if (!rooms.has(name) && Array.isArray(args)) start(name, args, cwd, claude === true, handler === true);
+        show(name);
       } else if (!busy && room !== shown && room !== HANDLER) close(room); // Its work is done, out of sight.
     } catch {} // A request this process cannot carry out changes nothing.
   });
@@ -597,12 +608,15 @@ async function openWindow(args) {
     if (left) process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
     fit();
   }
-  /** A room running pi with `args`, or, for a bot in Claude Code, Claude Code, which is yours while its room is open. */
-  function start(name, args, cwd, claude) {
+  /**
+   * A room running pi with `args`, with your handler's extensions in a conversation with your handler, or, for a bot in
+   * Claude Code, Claude Code, which is yours while its room is open.
+   */
+  function start(name, args, cwd, claude, handler) {
     if (claude && !claim(name, OPEN)) return; // A handoff has just taken it.
     let term;
     try {
-      term = pty.spawn(claude ? CLAUDE : process.execPath, claude ? args : [PI, ...(name === HANDLER ? HANDLER_LOADS : LOADS), ...args], {
+      term = pty.spawn(claude ? CLAUDE : process.execPath, claude ? args : [PI, ...(handler ? HANDLER_LOADS : LOADS), ...args], {
         name: process.env.TERM || "xterm-256color", cols: process.stdout.columns, rows: process.stdout.rows, cwd,
         env: { ...process.env, BOTMODE_ROOMS: url, BOTMODE_ROOM: name },
       });
@@ -631,7 +645,7 @@ async function openWindow(args) {
     });
   }
   try {
-    start(HANDLER, args, process.cwd());
+    start(HANDLER, args, process.cwd(), false, true);
   } catch {
     server.close();
     return openHandler(args);
