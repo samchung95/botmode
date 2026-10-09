@@ -99,9 +99,8 @@ export const DEFAULT = {
 const SKILLS = fileURLToPath(new URL("skills", import.meta.url));
 
 // pi loads this file afresh for every session it opens, so what must outlive one lives here: the bots this process runs
-// ({name, steps, stop}), the bot sessions open in this window, the owner's own session, how to redraw the window's list, and
-// the conversations with the handler the helper model has named, or is naming.
-const shared = globalThis[Symbol.for("botmode")] ??= { running: new Set(), entered: new Set(), home: undefined, render: undefined, named: new Set() };
+// ({name, steps, stop}), the bot sessions open in this window, the owner's own session, and how to redraw the window's list.
+const shared = globalThis[Symbol.for("botmode")] ??= { running: new Set(), entered: new Set(), home: undefined, render: undefined };
 if (!shared.exitHook) {
   shared.exitHook = true;
   process.once("exit", () => shared.running.forEach((run) => run.stop())); // Bots never outlive the pi that started them.
@@ -283,6 +282,16 @@ function folderOf(config, session, file = sessionFiles().get(session)) {
   return session === bot || !file ? own : startedIn(file) ?? own;
 }
 
+/** The objects in JSON lines, leaving out any line cut short. */
+const entriesOf = (text) => text.split("\n").flatMap((line) => {
+  try {
+    const entry = JSON.parse(line);
+    return isObject(entry) ? [entry] : [];
+  } catch {
+    return [];
+  }
+});
+
 /** The entries in the first 64 KB of a session's file, which pi's header starts; none for a file pi has not written yet. */
 function head(file) {
   const buffer = Buffer.alloc(64 * 1024);
@@ -293,14 +302,7 @@ function head(file) {
     return [];
   }
   try {
-    return buffer.toString("utf-8", 0, fs.readSync(fd, buffer)).split("\n").flatMap((line) => {
-      try {
-        const entry = JSON.parse(line);
-        return isObject(entry) ? [entry] : [];
-      } catch {
-        return []; // The last line, cut short.
-      }
-    });
+    return entriesOf(buffer.toString("utf-8", 0, fs.readSync(fd, buffer)));
   } finally {
     fs.closeSync(fd);
   }
@@ -313,14 +315,16 @@ function head(file) {
 const header = (file) => head(file).find((entry) => entry.type === "session") ?? {};
 
 /**
- * A conversation of your handler's as {file, id, cwd, title}: its name, from pi's /name or the helper model, or else its
- * first message, and "" while it has neither.
- * ponytail: reads the first 64 KB, so a conversation renamed after that keeps its first name; read the end too if that bites.
+ * A conversation of your handler's as {file, id, cwd, title}: its latest name, from pi's /name or the helper model, or
+ * else its first message, and "" while it has neither. It reads the whole file, as pi's /resume does, for the latest name.
  */
 function about(file) {
-  const entries = head(file);
+  let entries = [];
+  try {
+    entries = entriesOf(fs.readFileSync(file, "utf-8"));
+  } catch {} // pi has not written it yet.
   const { id, cwd } = entries.find((entry) => entry.type === "session") ?? {};
-  const named = entries.filter((entry) => entry.type === "session_info" && entry.name).at(-1)?.name;
+  const named = entries.filter((entry) => entry.type === "session_info").at(-1)?.name?.trim();
   const first = entries.find((entry) => entry.type === "message" && entry.message?.role === "user");
   return { file, id: id ?? HANDLER, cwd, title: named || (first ? oneLine(textOf(first.message.content), 60) : "") };
 }
@@ -663,20 +667,19 @@ async function runBot(config, target, how, prompt, chain, signal, onProgress) {
   }
 }
 
-/** A title of a few words for a task, from the helper model `spec` in a bare pi of its own; "" if it gives none within a minute. */
-const titleOf = (spec, task) => new Promise((resolve) => {
+/**
+ * A title of a few words for a conversation, so far titled `title`, with its newest `message`, from the helper model `spec`
+ * in a bare pi of its own; "" if it gives none within a minute.
+ */
+const titleOf = (spec, message, title) => new Promise((resolve) => {
   const { provider, id, thinking } = parseModel(spec);
-  const prompt = `Give this task a title of a few words, with no quotes or full stop. Reply with the title alone.\nThe task:\n${task}`;
+  const prompt = "Give a conversation a title of a few words, with no quotes or full stop. Reply with the title alone."
+    // Its start is enough for a title, and keeps a long message within Windows' 32K command line.
+    + `${title ? `\nIts title so far, to keep if it still fits: ${title}` : ""}\nIts newest message:\n${message.slice(0, 4000)}`;
   execFile(process.execPath, [piEntry(), "--mode", "json", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
     "--no-prompt-templates", "--no-context-files", "--model", `${provider}/${id}`, "--thinking", thinking ?? "off", prompt],
   { timeout: 60_000, windowsHide: true, maxBuffer: 4e6 }, (_error, stdout) => {
-    const reply = String(stdout).split("\n").flatMap((line) => {
-      try {
-        return [JSON.parse(line)];
-      } catch {
-        return [];
-      }
-    }).filter((event) => event.type === "message_end" && event.message?.role === "assistant").at(-1);
+    const reply = entriesOf(String(stdout)).filter((event) => event.type === "message_end" && event.message?.role === "assistant").at(-1);
     resolve(oneLine(textOf(reply?.message.content).replace(/^["'\s]+|["'.\s]+$/g, ""), 60));
   }).stdin.end(); // pi -p reads what is piped in until it ends.
 });
@@ -1159,8 +1162,9 @@ const replyText = (target, outcome) => `${outcome.session ?? target} ${outcome.o
 
 const WAIT = 10 * 60_000; // How long message waits for an answer before the answer comes as an ordinary message.
 
-// How many of your handler's conversations the lobby lists, newest first: pi's menu does not scroll. `botmode -r` has the rest.
+// How many of your handler's conversations the lobby lists, newest first, each read whole for its title. `botmode -r` has the rest.
 const LOBBY = 20;
+const NEW_TASK = "New task…"; // The lobby's first row, in a pi without its TUI.
 // Alt+Shift+Enter (4) and Ctrl+Enter (5) as the kitty keyboard protocol and xterm's modifyOtherKeys report them.
 const TASK_KEY = /^\x1b\[(?:13;[45](?::1)?u|27;[45];13~)$/;
 
@@ -1333,7 +1337,17 @@ export default function botmode(pi) {
     left = !ctx.isIdle() && { ...whoAmI(ctx), file: ctx.sessionManager.getSessionFile() };
   });
 
+  // Your conversations with your handler are titled for the lobby by the helper model, anew with each message you send.
+  let titling;
   pi.on("input", async (event, ctx) => {
+    const spec = !watching && ctx.hasUI && whoAmI(ctx).bot === HANDLER && event.text.trim() && loadConfig().defaults?.helperModel;
+    if (spec) {
+      const file = ctx.sessionManager.getSessionFile();
+      const asked = titling = titleOf(spec, event.text, pi.getSessionName());
+      asked.then((title) => { // The latest message's title, whichever answer comes back first.
+        if (title && title !== pi.getSessionName() && asked === titling && ctx.sessionManager.getSessionFile() === file) pi.setSessionName(title);
+      }).catch(() => {}); // You have left it since.
+    }
     if (!watching || event.source === "extension") return { action: "continue" };
     const sent = await tell(watching, event.text);
     ctx.ui.notify(sent.text, sent.ok ? "info" : "warning");
@@ -1351,14 +1365,6 @@ export default function botmode(pi) {
   pi.on("before_agent_start", async (event, ctx) => {
     const config = loadConfig();
     const me = whoAmI(ctx).bot;
-    // Your conversations with your handler are named after their task, once, by the helper model, for the lobby.
-    const file = ctx.sessionManager.getSessionFile();
-    if (ctx.hasUI && me === HANDLER && config.defaults?.helperModel && !pi.getSessionName() && !shared.named.has(file)) {
-      shared.named.add(file);
-      titleOf(config.defaults.helperModel, event.prompt).then((title) => {
-        if (title && ctx.sessionManager.getSessionFile() === file) pi.setSessionName(title);
-      }).catch(() => {}); // You have left it since.
-    }
     const team = teamPrompt(config, me, await remoteTeams(config), working());
     // With only the team tools, pi's coding-assistant prompt would contradict the bot's own.
     return { systemPrompt: config.bots[me].tools?.length === 0 ? team : `${event.systemPrompt}\n\n${team}` };
@@ -1535,19 +1541,57 @@ export default function botmode(pi) {
       for (const run of shared.running) { // Your jobs on a machine whose roster did not come.
         if (run.name.includes("/") && !remote.has(run.name)) choices.set(`${run.name} · working on ${address(run.name)[0]}`, () => watch(ctx, run.name));
       }
-      const choice = await ctx.ui.select("Sessions", [...choices.keys()]);
-      if (choice) await choices.get(choice)();
+      const choice = await lobbyChoice(ctx, [...choices.keys()]);
+      if (choice?.task) await startTask(ctx, choice.task);
+      else if (choice) await choices.get(choice)();
     },
   });
 
+  /**
+   * Your pick in the lobby: one of `rows`, or {task} for a new conversation with your handler. In your window you type the
+   * task under the sessions, as in Claude Code; in a pi without its TUI, the first row asks for it.
+   */
+  async function lobbyChoice(ctx, rows) {
+    const { Input, SelectList, DynamicBorder, getSelectListTheme, keyHint, rawKeyHint, truncateToWidth } = tui() ?? {};
+    if (!Input) {
+      const row = await ctx.ui.select("Sessions", [NEW_TASK, ...rows]);
+      const task = row === NEW_TASK && (await ctx.ui.input(NEW_TASK, "Your message to your handler"))?.trim();
+      return task ? { task } : row !== NEW_TASK && row;
+    }
+    return ctx.ui.custom((screen, theme, keys, done) => {
+      const input = new Input({ placeholder: "Type a message to start a new task", placeholderStyle: (text) => theme.fg("dim", text) });
+      const list = new SelectList(rows.map((row) => ({ value: row, label: row })), 12, getSelectListTheme());
+      const border = new DynamicBorder();
+      const hints = `${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "open, or start what you typed")}  ${keyHint("tui.select.cancel", "cancel")}`;
+      return {
+        get focused() { return input.focused; },
+        set focused(value) { input.focused = value; }, // Places the cursor in the input.
+        render: (width) => [...border.render(width), ` ${theme.fg("accent", theme.bold("Sessions"))}`, "", ...list.render(width), "",
+          ...input.render(width), "", ` ${hints}`, ...border.render(width)].map((line) => truncateToWidth(line, width, "")),
+        invalidate: () => input.invalidate(),
+        handleInput(key) {
+          const task = input.getValue().trim();
+          if (keys.matches(key, "tui.select.cancel")) done(undefined);
+          else if (keys.matches(key, "tui.select.confirm")) done(task ? { task } : list.getSelectedItem()?.value);
+          else if (keys.matches(key, "tui.select.up") || keys.matches(key, "tui.select.down")) list.handleInput(key);
+          else input.handleInput(key);
+          screen.requestRender();
+        },
+      };
+    });
+  }
+
+  /** Starts a new conversation with your handler, in the folder you are in, with `text`, if any, as your first message. */
+  async function startTask(ctx, text) {
+    const file = newConversation(ctx.cwd);
+    const id = idOf(path.basename(file));
+    if (text) post(id, { text, owner: true }); // It sends your message as it opens.
+    await enter(ctx, id, file, ctx.cwd);
+  }
+
   pi.registerCommand("task", {
-    description: "Start a new conversation with your handler, apart from this one, with this message: /task <message>. Alt+Shift+Enter, or Ctrl+Enter, sends what you typed the same way",
-    async handler(args, ctx) {
-      const file = newConversation(ctx.cwd);
-      const id = idOf(path.basename(file));
-      if (args.trim()) post(id, { text: args.trim(), owner: true }); // It sends your message as it opens.
-      await enter(ctx, id, file, ctx.cwd);
-    },
+    description: "Start a new conversation with your handler, apart from this one, with this message: /task <message>. Alt+Shift+Enter, or Ctrl+Enter, sends what you typed the same way, as does the lobby",
+    handler: (args, ctx) => startTask(ctx, args.trim()),
   });
 
   /** A model you are signed in to, from pi's menu one "/" level at a time, as `botmode setup` does; "" for `none`, undefined to go back. */
@@ -1568,7 +1612,7 @@ export default function botmode(pi) {
   }
 
   pi.registerCommand("botmode", {
-    description: "Botmode's settings: your bots' model, and the helper model that names your conversations with your handler",
+    description: "Botmode's settings: your bots' model, and the helper model that titles your conversations with your handler",
     async handler(_args, ctx) {
       const settings = { model: ["Bots' model", "pi's default"], helperModel: ["Helper model", "None: the lobby shows a conversation's first words"] };
       for (;;) {

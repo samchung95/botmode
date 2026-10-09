@@ -447,7 +447,7 @@ async function setup(code) {
   }
   say("\n2. Your bots' model");
   await chooseModel(pi.runtime);
-  say("\n3. A helper model, small and quick, that names your conversations with your handler after their task");
+  say("\n3. A helper model, small and quick, that titles your conversations with your handler, again at each message you send");
   await chooseModel(pi.runtime, "helperModel");
   say('\n4. Claude Code, which coding bots ("agent": "claude") work in');
   await claudeStep();

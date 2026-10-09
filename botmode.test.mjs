@@ -239,7 +239,8 @@ test("/sessions enters a bot's session as that bot, and the overview goes back t
   };
   try {
     await handler.commands.sessions.handler("", handler.ctx);
-    assert.equal(shown[0], `\x1b[1;38;5;${colourOf("handler")}mNew conversation\x1b[22;39m · you are here`); // Yours, in your handler's colour.
+    assert.equal(shown[0], "New task…");
+    assert.equal(shown[1], `\x1b[1;38;5;${colourOf("handler")}mNew conversation\x1b[22;39m · you are here`); // Yours, in your handler's colour.
     assert.match(shown.join("\n"), /^research\.2 · idle · /m);
     assert.match(handler.switched[0], /_research\.2\.jsonl$/);
     // pi opens research.2's session in this window: you now talk with that copy of research directly.
@@ -247,7 +248,7 @@ test("/sessions enters a bot's session as that bot, and the overview goes back t
     assert.equal(copy.status.botmode, "research.2 · ← or /sessions goes back to your handler");
     assert.ok(copy.status.tools.includes("message") && !copy.status.tools.includes("configure"));
     assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "x" }), /research\.2 is busy \(open in your window\)/);
-    copy.ctx.ui.select = async (_title, options) => options[0];
+    copy.ctx.ui.select = async (_title, options) => options[1];
     await copy.commands.sessions.handler("", copy.ctx);
     assert.deepEqual(copy.switched, [path.join(HOME, "owner", "owner.jsonl")]);
     copy.close(); // pi closes the copy's session as it switches back.
@@ -371,10 +372,10 @@ test("leaving a session at work leaves it working: it carries on without you, an
     delete process.env.FAKE_PI_SLOW;
     copy = await open("research.2", { window: true });
     let shown;
-    copy.ctx.ui.select = async (_title, options) => (shown = options, options[0]);
+    copy.ctx.ui.select = async (_title, options) => (shown = options, options[1]);
     copy.ctx.isIdle = () => false; // and so does research.2 when you go back mid-reply.
     await copy.commands.sessions.handler("", copy.ctx);
-    assert.match(shown[0], / · back to your conversation · working · /);
+    assert.match(shown[1], / · back to your conversation · working · /);
     await copy.leave(home);
     assert.match(working().find((session) => session.id === "research.2")?.task ?? "", /^Carry on where you stopped/);
     // Your handler's conversation is still at work: you watch it, and what you type reaches it.
@@ -420,7 +421,7 @@ test("in rooms, the lobby opens a session in a room of its own and never stops t
     process.env.BOTMODE_ROOM = "research.2";
     copy = await open("research.2", { window: true });
     assert.match(await handler.call("handoff", { bot: "research.2", session: "continue", task: "x" }), /research\.2 is busy \(open in your window\)/);
-    copy.ctx.ui.select = async (_title, options) => options[0];
+    copy.ctx.ui.select = async (_title, options) => options[1];
     await copy.commands.sessions.handler("", copy.ctx);
     assert.deepEqual(copy.switched, []);
     assert.deepEqual(opened().at(-1), { room: "research.2", busy: false, open: "handler" });
@@ -798,6 +799,28 @@ test("/task starts a new conversation with your handler in a room of its own, an
   }
 });
 
+test("the lobby starts a new task with the message you type there, as /task does", async () => {
+  const handler = await open();
+  let typed, task;
+  handler.ctx.ui.select = async (title, options) => title === "Sessions" ? options[0] : undefined;
+  handler.ctx.ui.input = async () => typed;
+  try {
+    // Without pi's TUI the lobby's first row asks for the message; in your window you type it above the sessions.
+    await handler.commands.sessions.handler("", handler.ctx); // You typed nothing.
+    assert.deepEqual(handler.switched, []);
+    typed = " compare hotel prices in Shibuya ";
+    await handler.commands.sessions.handler("", handler.ctx);
+    const file = handler.switched.at(-1);
+    assert.match(idOf(file), /^handler\.\d+$/);
+    task = await open(undefined, { conversation: file });
+    await until(() => task.dispatched.length);
+    assert.deepEqual(task.dispatched, ["compare hotel prices in Shibuya"]);
+  } finally {
+    handler.close();
+    task?.close();
+  }
+});
+
 test("each conversation with your handler has an address, where the replies and messages of the bots it hands work to reach it", async () => {
   applyPatch({ bots: { research: { name: "Researcher", description: "Finds and summarizes sources" } } });
   const handler = await open(); // A conversation from before they had addresses.
@@ -850,7 +873,9 @@ test("the lobby lists your handler's conversations from every folder, newest fir
   const said = (text) => ({ type: "message", message: { role: "user", content: [{ type: "text", text }] } });
   const tokyo = await start(elsewhere, said("Compare  flight prices\nto Tokyo for May"));
   await start(process.cwd()); // Never written in, so not listed.
-  const build = await start(process.cwd(), said("the build fails on main"), { type: "session_info", name: "Fix the build" });
+  // Named again, far into a long conversation.
+  const build = await start(process.cwd(), said("the build fails on main"), { type: "session_info", name: "Build" },
+    said("the log: ".repeat(10_000)), { type: "session_info", name: "Fix the build" });
   const paint = (text) => `\x1b[1;38;5;${colourOf("handler")}m${text}\x1b[22;39m`;
   let shown, rooms, main;
   handler.ctx.ui.select = async (_title, options) => (shown = options).find((option) => option.includes("Tokyo"));
@@ -881,7 +906,7 @@ test("the lobby lists your handler's conversations from every folder, newest fir
   }
 });
 
-test("a helper model names each conversation with your handler after its task; without one, the lobby shows its first words", async () => {
+test("a helper model titles each conversation with your handler, again with each message you send; without one, the lobby shows its first words", async () => {
   assert.match(applyPatch({ defaults: { helperModel: 7 } }).join(), /defaults must be/);
   assert.deepEqual(applyPatch({ defaults: { helperModel: "fake/mini:high" } }), []);
   const handler = await open();
@@ -891,13 +916,17 @@ test("a helper model names each conversation with your handler after its task; w
   };
   const [named, plain] = [await conversation(), await conversation()];
   try {
-    await named.prompt("book flights to Tokyo for the May trip");
+    await named.type("book flights to Tokyo for the May trip");
     await until(() => named.name());
     assert.equal(named.name(), "fake/mini named it: book flights to Tokyo for the May trip");
-    await named.prompt("and a hotel"); // Named once.
-    assert.equal(named.name(), "fake/mini named it: book flights to Tokyo for the May trip");
+    await named.type("and a hotel near Shibuya");
+    await until(() => named.name().endsWith("Shibuya"));
+    // Two at once: the title fits the later one, whichever answer comes back first.
+    await Promise.all([named.type("and a car"), named.type("and travel insurance")]);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(named.name(), "fake/mini named it: and travel insurance");
     assert.deepEqual(applyPatch({ defaults: { helperModel: null } }), []);
-    await plain.prompt("fix the build");
+    await plain.type("fix the build");
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(plain.name(), undefined);
   } finally {

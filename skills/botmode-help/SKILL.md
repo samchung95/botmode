@@ -9,7 +9,7 @@ description: How to use Botmode and fix it. Its commands, where its files are, M
 
 The owner runs these in a terminal:
 - `botmode`: the window, with you. It carries on your last conversation with the owner in the folder it starts in, and `botmode -r` picks another. `botmode -p "..."` sends you one message without the window, in that same conversation.
-- `botmode setup`: model sign-in, the bots' model, the helper model that names your conversations, Claude Code's sign-in, and letting other machines connect. `botmode setup <invite>` connects this machine to the one that printed the invite.
+- `botmode setup`: model sign-in, the bots' model, the helper model that titles your conversations, Claude Code's sign-in, and letting other machines connect. `botmode setup <invite>` connects this machine to the one that printed the invite.
 - `botmode invite`: prints the invite again. It holds the secret the machines share, so the owner sends it only to themselves.
 - `botmode status`: sign-ins, the bots' and helper's models, bots, host, tailnet, what is at work, and the other machines.
 - `botmode restart` restarts this machine's host. `botmode update` installs the latest Botmode, then restarts it.
@@ -19,7 +19,7 @@ You may run `botmode status` yourself. The others ask questions or print the sec
 
 In the window:
 - `/task <message>`, or Alt+Shift+Enter on what the owner typed (or Ctrl+Enter, where the terminal tells it apart), starts a new conversation with you, apart from the current one, in a room of its own; pi's `/new` does the same. Each conversation has an address, `handler.1`, `handler.2`…, where its bots' replies and messages reach it.
-- `/sessions`, or ← on an empty prompt, is the lobby: your conversations from every folder at the top, named after their task in your colour, then the bot sessions. `/sessions <id>` opens a session or a conversation.
+- `/sessions`, or ← on an empty prompt, is the lobby: your conversations from every folder at the top, by their titles in your colour, then the bot sessions. A message the owner types in the box under them starts a new conversation with you, as `/task` does. `/sessions <id>` opens a session or a conversation.
 - `/bot <id> <message>` talks to one bot directly.
 - `/model` changes the model of this session.
 - `/botmode` is the settings: the bots' default model and the helper model.
@@ -64,4 +64,4 @@ Every bot, you included, works through billion-context: a proxy between it and i
 - **`botmode update` says EBUSY.** Another botmode window is using its files: close every other window, then run it again.
 - **Every room closed at once.** Quitting your own room closes them all and stops their work.
 - **The task key types a new line, sends the message here, or does nothing.** On Windows, Ctrl+Enter is pi's new line; Alt+Shift+Enter starts a task in any terminal there. On Mac and Linux, only terminals that tell modified Enter keys apart (the kitty keyboard protocol or xterm's modifyOtherKeys) pass either key on. `/task <message>` works in any terminal.
-- **Conversations in the lobby have no names, only their first words.** There is no helper model, or it is unavailable. `/botmode` sets one; only conversations in the window are named, once each.
+- **Conversations in the lobby have no names, only their first words.** There is no helper model, or it is unavailable. `/botmode` sets one; only conversations in the window get titles, at each message the owner sends there.
